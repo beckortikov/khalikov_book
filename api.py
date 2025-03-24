@@ -159,4 +159,4 @@ async def health_check():
     return {"status": "ok", "message": "Система работает нормально"}
 
 if __name__ == "__main__":
-    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run("api:app", host="localhost", port=8001, reload=False)

@@ -5,7 +5,7 @@ import time
 import json
 import os
 
-API_URL = "http://localhost:8000"  # Адрес API по умолчанию
+API_URL = "http://localhost:8001"  # Адрес API по умолчанию
 
 def check_health():
     """Проверка статуса API"""
@@ -89,9 +89,12 @@ def interactive_mode():
         ask_question(question)
 
 def main():
+    
+    global API_URL
+    
     parser = argparse.ArgumentParser(description="Клиент для API книжного помощника")
 
-    parser.add_argument('--url', default=API_URL, help=f"URL API (по умолчанию: {API_URL})")
+    parser.add_argument('--url', default=None, help=f"URL API (по умолчанию: {API_URL})")
 
     subparsers = parser.add_subparsers(dest='command', help='Команды')
 
@@ -112,8 +115,8 @@ def main():
     args = parser.parse_args()
 
     # Обновляем URL API, если указан
-    global API_URL
-    API_URL = args.url
+    if args.url:
+        API_URL = args.url
 
     if args.command == 'status':
         check_health()
