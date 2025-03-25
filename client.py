@@ -58,6 +58,11 @@ def ask_question(question):
         print("-" * 80)
         print(data['answer'])
         print("-" * 80)
+
+        # Проверка на нерелевантный вопрос
+        if "Я могу отвечать только на вопросы о содержании книги" in data['answer']:
+            print("\nПодсказка: Пожалуйста, задавайте вопросы, связанные с содержанием загруженной книги.")
+
         return True
     except requests.RequestException as e:
         print(f"Ошибка при отправке вопроса: {str(e)}")

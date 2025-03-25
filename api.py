@@ -80,6 +80,11 @@ async def ask_question(request: QuestionRequest):
     try:
         logger.debug(f"Получен вопрос: {request.question}")
 
+        # Проверка релевантности вопроса
+        if not is_book_related_question(request.question):
+            logger.info(f"Получен нерелевантный вопрос: {request.question}")
+            return {"answer": "Я могу отвечать только на вопросы о содержании книги. Пожалуйста, задайте вопрос, связанный с текстом книги."}
+
         # Получаем ответ от RAG
         response = rag_instance.ask_question(request.question)
         logger.info("Успешно получен ответ на вопрос")
@@ -89,6 +94,41 @@ async def ask_question(request: QuestionRequest):
         error_msg = f"Ошибка при обработке вопроса: {str(e)}"
         logger.error(error_msg, exc_info=True)
         raise HTTPException(status_code=500, detail=error_msg)
+
+def is_book_related_question(question: str) -> bool:
+    """
+    Проверяет, относится ли вопрос к содержанию книги.
+
+    Функция анализирует вопрос и определяет, связан ли он с книгой
+    или это нерелевантный запрос (например, просьба написать код,
+    рецепт, выполнить задачу, не связанную с содержанием книги).
+
+    Args:
+        question: Текст вопроса
+
+    Returns:
+        bool: True если вопрос относится к книге, False в противном случае
+    """
+    # Приводим вопрос к нижнему регистру для упрощения проверки
+    question_lower = question.lower()
+
+    # Ключевые слова, указывающие на нерелевантные запросы
+    irrelevant_patterns = [
+        "напиши код", "напиши программу", "создай программу",
+        "сделай", "приготовь", "рецепт", "как готовить",
+        "погода", "курс валют", "прогноз погоды",
+        "как построить", "создай сайт", "напиши сайт",
+        "напиши песню", "напиши стих", "напиши рассказ",
+        "какой сегодня день", "который час"
+    ]
+
+    # Проверяем наличие нерелевантных паттернов в вопросе
+    for pattern in irrelevant_patterns:
+        if pattern in question_lower:
+            return False
+
+    # По умолчанию считаем вопрос релевантным
+    return True
 
 @app.post("/upload", response_model=StatusResponse)
 async def upload_book(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
