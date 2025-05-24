@@ -1,5 +1,4 @@
-.env
-book.pdf
+
 *.log
 stremlit_ui.py
 *.pyc
