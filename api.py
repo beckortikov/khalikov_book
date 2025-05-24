@@ -4,9 +4,9 @@ from main import BookRAG
 import os
 import logging
 import uvicorn
+import shutil
 from typing import Optional, List, Dict, Any
 from fastapi.middleware.cors import CORSMiddleware
-import shutil
 
 # Настройка логирования
 logging.basicConfig(
@@ -35,9 +35,17 @@ app.add_middleware(
 # Модели данных
 class QuestionRequest(BaseModel):
     question: str
+    section_filter: Optional[str] = None
+
+class SectionSearchRequest(BaseModel):
+    section_name: str
+    query: Optional[str] = ""
 
 class QuestionResponse(BaseModel):
     answer: str
+
+class SectionsResponse(BaseModel):
+    sections: List[str]
 
 class StatusResponse(BaseModel):
     status: str
@@ -57,7 +65,8 @@ async def startup_event():
 
     try:
         logger.info("Инициализация RAG при запуске сервера...")
-        rag_instance = BookRAG()  # Используем файл по умолчанию (book.pdf)
+        # Используем новую систему с поддержкой разделов
+        rag_instance = BookRAG(use_sections=True, pdf_directory="book")
         logger.info("Система успешно инициализирована!")
     except FileNotFoundError as e:
         logger.error(f"Файл не найден: {str(e)}", exc_info=True)
@@ -79,14 +88,16 @@ async def ask_question(request: QuestionRequest):
 
     try:
         logger.debug(f"Получен вопрос: {request.question}")
+        if request.section_filter:
+            logger.debug(f"Фильтр по разделу: {request.section_filter}")
 
         # Проверка релевантности вопроса
         if not is_book_related_question(request.question):
             logger.info(f"Получен нерелевантный вопрос: {request.question}")
             return {"answer": "Я могу отвечать только на вопросы о содержании книги. Пожалуйста, задайте вопрос, связанный с текстом книги."}
 
-        # Получаем ответ от RAG
-        response = rag_instance.ask_question(request.question)
+        # Получаем ответ от RAG с учетом фильтра по разделу
+        response = rag_instance.ask_question(request.question, section_filter=request.section_filter)
         logger.info("Успешно получен ответ на вопрос")
 
         return {"answer": response}
@@ -171,8 +182,16 @@ async def reinitialize_rag(file_path: str):
     try:
         logger.info(f"Начало реинициализации RAG с новым файлом: {file_path}")
 
-        # Создаем новый экземпляр BookRAG с новым файлом
-        new_rag = BookRAG(pdf_path=file_path)
+        # Создаем новый экземпляр BookRAG с новой системой
+        # Если загружен новый файл, используем его как основную книгу
+        if file_path == "book.pdf":
+            # Копируем в папку book для консистентности
+            if not os.path.exists("book"):
+                os.makedirs("book")
+            if not os.path.exists("book/book.pdf"):
+                shutil.copy(file_path, "book/book.pdf")
+
+        new_rag = BookRAG(use_sections=True, pdf_directory="book")
 
         # Заменяем старый экземпляр новым
         rag_instance = new_rag
@@ -197,6 +216,45 @@ async def health_check():
         return {"status": "not_ready", "message": "RAG система не инициализирована"}
 
     return {"status": "ok", "message": "Система работает нормально"}
+
+@app.post("/search_section", response_model=QuestionResponse)
+async def search_in_section(request: SectionSearchRequest):
+    """Поиск в конкретном разделе книги"""
+    global rag_instance
+
+    if rag_instance is None:
+        logger.error("RAG не инициализирован")
+        raise HTTPException(status_code=503, detail="Система не готова. Пожалуйста, повторите запрос позже.")
+
+    try:
+        logger.debug(f"Поиск в разделе: {request.section_name}, запрос: {request.query}")
+
+        response = rag_instance.search_by_section(request.section_name, request.query)
+        logger.info(f"Успешно выполнен поиск в разделе {request.section_name}")
+
+        return {"answer": response}
+    except Exception as e:
+        error_msg = f"Ошибка при поиске в разделе: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=error_msg)
+
+@app.get("/sections", response_model=SectionsResponse)
+async def get_sections():
+    """Получение списка доступных разделов книги"""
+    global rag_instance
+
+    if rag_instance is None:
+        logger.error("RAG не инициализирован")
+        raise HTTPException(status_code=503, detail="Система не готова. Пожалуйста, повторите запрос позже.")
+
+    try:
+        sections = rag_instance.get_available_sections()
+        logger.info("Успешно получен список разделов")
+        return {"sections": sections}
+    except Exception as e:
+        error_msg = f"Ошибка при получении списка разделов: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=error_msg)
 
 if __name__ == "__main__":
     uvicorn.run("api:app", host="localhost", port=8001, reload=False)
