@@ -42,20 +42,32 @@ class BookRAG:
             self.pinecone_environment = os.getenv("PINECONE_ENVIRONMENT", "gcp-starter")
             self.index_name = "book-rag-index"
 
+            # Сначала проверяем Pinecone
+            pinecone_available = False
             if self.pinecone_api_key:
-                self._init_pinecone()
+                pinecone_available = self._init_pinecone()
 
-            # Загрузка документов
-            if use_sections:
-                self.documents = self._load_all_sections()
+            # Проверяем есть ли уже данные в Pinecone
+            if pinecone_available and self._has_existing_embeddings():
+                logger.info("Найдены существующие эмбеддинги в Pinecone. Пропускаем загрузку PDF.")
+                # Создаем пустые списки для совместимости
+                self.documents = []
+                self.splits = []
+                # Создаем векторное хранилище из существующих данных
+                self.vectorstore = self._load_existing_vectorstore()
             else:
-                self.documents = self._load_full_book()
+                logger.info("Эмбеддинги не найдены. Загружаем PDF и создаем эмбеддинги.")
+                # Загрузка документов
+                if use_sections:
+                    self.documents = self._load_all_sections()
+                else:
+                    self.documents = self._load_full_book()
 
-            # Создание чанков
-            self.splits = self._create_hierarchical_chunks()
+                # Создание чанков
+                self.splits = self._create_hierarchical_chunks()
 
-            # Создание или загрузка векторного хранилища
-            self.vectorstore = self._create_or_load_vectorstore()
+                # Создание векторного хранилища
+                self.vectorstore = self._create_or_load_vectorstore()
 
             # Инициализация моделей
             self._initialize_models()
@@ -140,10 +152,50 @@ class BookRAG:
             logger.info(f"Статистика Pinecone индекса: {stats}")
 
             logger.info("Pinecone успешно инициализирован")
+            return True
 
         except Exception as e:
             logger.error(f"Ошибка инициализации Pinecone: {str(e)}")
             self.pinecone_index = None
+            return False
+
+    def _has_existing_embeddings(self):
+        """Проверяет наличие существующих эмбеддингов в Pinecone"""
+        if not hasattr(self, 'pinecone_index') or not self.pinecone_index:
+            return False
+
+        try:
+            stats = self.pinecone_index.describe_index_stats()
+            vector_count = stats.get('total_vector_count', 0)
+            logger.info(f"Найдено векторов в Pinecone: {vector_count}")
+            return vector_count > 0
+        except Exception as e:
+            logger.error(f"Ошибка проверки существующих эмбеддингов: {str(e)}")
+            return False
+
+    def _load_existing_vectorstore(self):
+        """Загружает существующее векторное хранилище из Pinecone"""
+        logger.info("Загрузка существующего векторного хранилища из Pinecone")
+
+        # Создаем класс для преобразования всех запросов к нижнему регистру
+        class CaseInsensitiveEmbeddings(OpenAIEmbeddings):
+            def __init__(self):
+                # Используем text-embedding-3-large для лучшего качества
+                super().__init__(model="text-embedding-3-large")
+
+            def embed_query(self, text: str) -> list:
+                return super().embed_query(text.lower())
+
+        embeddings = CaseInsensitiveEmbeddings()
+
+        vectorstore = Pinecone(
+            index=self.pinecone_index,
+            embedding=embeddings,
+            text_key="text"
+        )
+
+        logger.info("Существующее векторное хранилище успешно загружено")
+        return vectorstore
 
     def _load_full_book(self):
         """Загрузка полной книги"""
@@ -553,18 +605,19 @@ class BookRAG:
             else:
                 vector_docs = self.vectorstore.similarity_search(normalized_question, k=5)
 
-            # Ключевой поиск с фильтрацией
-            keywords = self._extract_keywords(normalized_question)
+            # Ключевой поиск с фильтрацией (только если self.splits не пуст)
             keyword_docs = []
+            if self.splits:  # Проверяем что splits не пуст
+                keywords = self._extract_keywords(normalized_question)
 
-            for doc in self.splits:
-                # Применяем фильтр по разделу если указан
-                if section_filter and doc.metadata.get('section') != section_filter:
-                    continue
+                for doc in self.splits:
+                    # Применяем фильтр по разделу если указан
+                    if section_filter and doc.metadata.get('section') != section_filter:
+                        continue
 
-                doc_content_lower = doc.page_content.lower()
-                if any(keyword in doc_content_lower for keyword in keywords):
-                    keyword_docs.append(doc)
+                    doc_content_lower = doc.page_content.lower()
+                    if any(keyword in doc_content_lower for keyword in keywords):
+                        keyword_docs.append(doc)
 
             # Объединение результатов
             unique_docs = {}
@@ -604,10 +657,14 @@ class BookRAG:
             if doc.metadata.get('chunk_type') == 'large':
                 context_parts.append(doc.page_content)
             else:
-                # Для малых чанков добавляем соседние фрагменты
-                page_num = doc.metadata.get('page')
-                context_parts.extend([d.page_content for d in self.splits
-                                   if d.metadata.get('page') == page_num])
+                # Для малых чанков добавляем соседние фрагменты (только если self.splits не пуст)
+                if self.splits:
+                    page_num = doc.metadata.get('page')
+                    context_parts.extend([d.page_content for d in self.splits
+                                       if d.metadata.get('page') == page_num])
+                else:
+                    # Если splits пуст, просто добавляем сам документ
+                    context_parts.append(doc.page_content)
 
         return "\n\n".join(set(context_parts))
 
@@ -691,23 +748,6 @@ class BookRAG:
                 available_sections = ', '.join(self.sections_mapping.keys())
                 return f"Раздел '{section_name}' не найден. Доступные разделы: {available_sections}"
 
-            # Проверяем есть ли документы в этом разделе
-            section_docs = [doc for doc in self.splits if doc.metadata.get('section') == section_key]
-
-            logger.info(f"Найдено документов в разделе '{section_key}': {len(section_docs)}")
-
-            # Диагностика: показываем какие разделы вообще есть
-            all_sections = set([doc.metadata.get('section', 'unknown') for doc in self.splits])
-            logger.debug(f"Все доступные разделы в документах: {sorted(all_sections)}")
-
-            # Диагностика: показываем примеры метаданных
-            if self.splits:
-                sample_doc = self.splits[0]
-                logger.debug(f"Пример метаданных документа: {sample_doc.metadata}")
-
-            if not section_docs:
-                return f"В разделе '{section_name}' не найдено документов. Доступные разделы в системе: {sorted(all_sections)}"
-
             # Если запрос не указан, возвращаем общую информацию о разделе
             if not query:
                 query = f"Расскажи о содержании раздела {section_name}"
@@ -723,3 +763,40 @@ class BookRAG:
     def get_available_sections(self) -> list:
         """Получение списка доступных разделов"""
         return list(self.sections_mapping.keys())
+
+    def force_rebuild_embeddings(self):
+        """Принудительное пересоздание эмбеддингов"""
+        logger.info("Принудительное пересоздание эмбеддингов...")
+
+        try:
+            # Очищаем Pinecone индекс если он существует
+            if hasattr(self, 'pinecone_index') and self.pinecone_index:
+                logger.info("Очистка существующего Pinecone индекса...")
+                # Удаляем все векторы из индекса
+                self.pinecone_index.delete(delete_all=True)
+                logger.info("Pinecone индекс очищен")
+
+            # Загружаем документы заново
+            logger.info("Загрузка документов...")
+            if self.use_sections:
+                self.documents = self._load_all_sections()
+            else:
+                self.documents = self._load_full_book()
+
+            # Создаем чанки заново
+            logger.info("Создание чанков...")
+            self.splits = self._create_hierarchical_chunks()
+
+            # Создаем векторное хранилище заново
+            logger.info("Создание векторного хранилища...")
+            self.vectorstore = self._create_or_load_vectorstore()
+
+            # Переинициализируем модели
+            self._initialize_models()
+
+            logger.info("Эмбеддинги успешно пересозданы")
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка при пересоздании эмбеддингов: {str(e)}", exc_info=True)
+            return False

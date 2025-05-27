@@ -1,5 +1,5 @@
-
 *.log
 stremlit_ui.py
 *.pyc
+test_pinecone_optimization.py
 

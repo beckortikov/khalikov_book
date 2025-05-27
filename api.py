@@ -256,5 +256,54 @@ async def get_sections():
         logger.error(error_msg, exc_info=True)
         raise HTTPException(status_code=500, detail=error_msg)
 
+@app.post("/rebuild_embeddings", response_model=StatusResponse)
+async def rebuild_embeddings(background_tasks: BackgroundTasks):
+    """Принудительное пересоздание эмбеддингов"""
+    global rag_instance, initializing
+
+    if rag_instance is None:
+        logger.error("RAG не инициализирован")
+        raise HTTPException(status_code=503, detail="Система не готова. Пожалуйста, повторите запрос позже.")
+
+    if initializing:
+        raise HTTPException(status_code=409, detail="Система уже находится в процессе инициализации")
+
+    try:
+        logger.info("Запуск принудительного пересоздания эмбеддингов...")
+
+        # Запускаем пересоздание в фоне
+        background_tasks.add_task(force_rebuild_embeddings_task)
+
+        return {"status": "processing", "message": "Началось пересоздание эмбеддингов. Это может занять несколько минут."}
+
+    except Exception as e:
+        error_msg = f"Ошибка при запуске пересоздания эмбеддингов: {str(e)}"
+        logger.error(error_msg, exc_info=True)
+        raise HTTPException(status_code=500, detail=error_msg)
+
+async def force_rebuild_embeddings_task():
+    """Фоновая задача для пересоздания эмбеддингов"""
+    global rag_instance, initializing
+
+    initializing = True
+
+    try:
+        logger.info("Начало принудительного пересоздания эмбеддингов...")
+
+        if rag_instance:
+            success = rag_instance.force_rebuild_embeddings()
+            if success:
+                logger.info("Эмбеддинги успешно пересозданы")
+            else:
+                logger.error("Ошибка при пересоздании эмбеддингов")
+        else:
+            logger.error("RAG instance не найден")
+
+    except Exception as e:
+        logger.error(f"Критическая ошибка при пересоздании эмбеддингов: {str(e)}", exc_info=True)
+
+    finally:
+        initializing = False
+
 if __name__ == "__main__":
     uvicorn.run("api:app", host="localhost", port=8001, reload=False)
