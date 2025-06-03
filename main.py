@@ -181,10 +181,7 @@ class BookRAG:
         class CaseInsensitiveEmbeddings(OpenAIEmbeddings):
             def __init__(self):
                 # Используем text-embedding-3-large для лучшего качества
-                super().__init__(
-                    model="text-embedding-3-large",
-                    openai_api_key=os.getenv("OPENAI_API_KEY")
-                )
+                super().__init__(model="text-embedding-3-large")
 
             def embed_query(self, text: str) -> list:
                 return super().embed_query(text.lower())
@@ -374,10 +371,7 @@ class BookRAG:
         class CaseInsensitiveEmbeddings(OpenAIEmbeddings):
             def __init__(self):
                 # Используем text-embedding-3-large для лучшего качества
-                super().__init__(
-                    model="text-embedding-3-large",
-                    openai_api_key=os.getenv("OPENAI_API_KEY")
-                )
+                super().__init__(model="text-embedding-3-large")
 
             def embed_query(self, text: str) -> list:
                 return super().embed_query(text.lower())

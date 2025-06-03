@@ -1,6 +1,6 @@
 langchain==0.0.352
 langchain-community==0.0.13
-openai==1.6.1
+openai==1.23.2
 faiss-cpu==1.7.4
 pinecone-client==2.2.4
 pypdf==3.17.4
@@ -10,4 +10,4 @@ uvicorn==0.24.0
 python-multipart==0.0.6
 requests==2.31.0
 pinecone==5.4.2
-streamlit
+streamlit==1.31.1
