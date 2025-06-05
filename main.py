@@ -322,18 +322,20 @@ class BookRAG:
         logger.debug("Создание иерархических чанков...")
 
         # Уменьшаем количество чанков для избежания лимитов API
-        # Большие чанки для контекста - увеличиваем размер
+        # Большие чанки для контекста
         large_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=3000,  # Увеличено с 2000
-            chunk_overlap=300,  # Увеличено с 200
-            length_function=len
+            chunk_size=1500,  # Уменьшено для более точного поиска
+            chunk_overlap=500,  # Увеличено для лучшего сохранения контекста
+            length_function=len,
+            separators=["\n\n", "\n", ".", "!", "?", ";"]  # Добавлены умные разделители
         )
 
-        # Малые чанки для точного поиска - увеличиваем размер
+        # Малые чанки для точного поиска
         small_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,  # Увеличено с 500
-            chunk_overlap=200,  # Увеличено с 100
-            length_function=len
+            chunk_size=500,  # Уменьшено для поиска конкретных деталей
+            chunk_overlap=250,  # Увеличено для лучшего контекста
+            length_function=len,
+            separators=["\n\n", "\n", ".", "!", "?", ";"]  # Добавлены умные разделители
         )
 
         large_chunks = large_splitter.split_documents(self.documents)
@@ -587,67 +589,109 @@ class BookRAG:
         try:
             normalized_question = question.lower()
 
-            # Векторный поиск
+            # Увеличиваем количество результатов для лучшего охвата
+            k_vector = 10  # Увеличено с 5
+            k_final = 12   # Увеличено с 8
+
+            # Векторный поиск с scoring
             if section_filter:
-                # Фильтрация по разделу (для FAISS используем поиск по всем и фильтруем результат)
-                if hasattr(self.vectorstore, 'similarity_search'):
-                    # Для FAISS сначала ищем, потом фильтруем
-                    vector_docs = self.vectorstore.similarity_search(normalized_question, k=10)
-                    vector_docs = [doc for doc in vector_docs if doc.metadata.get('section') == section_filter][:5]
+                if hasattr(self.vectorstore, 'similarity_search_with_score'):
+                    # Для FAISS используем поиск с оценкой релевантности
+                    vector_results = self.vectorstore.similarity_search_with_score(normalized_question, k=k_vector)
+                    vector_docs = [(doc, score) for doc, score in vector_results
+                                 if doc.metadata.get('section') == section_filter][:k_vector]
                 else:
                     # Для Pinecone используем фильтры
                     filter_dict = {"section": {"$eq": section_filter}}
                     vector_docs = self.vectorstore.similarity_search(
                         normalized_question,
-                        k=5,
+                        k=k_vector,
                         filter=filter_dict
                     )
+                    vector_docs = [(doc, 1.0) for doc in vector_docs]  # Добавляем фиктивные scores
             else:
-                vector_docs = self.vectorstore.similarity_search(normalized_question, k=5)
+                if hasattr(self.vectorstore, 'similarity_search_with_score'):
+                    vector_results = self.vectorstore.similarity_search_with_score(normalized_question, k=k_vector)
+                    vector_docs = vector_results
+                else:
+                    vector_docs = [(doc, 1.0) for doc in self.vectorstore.similarity_search(normalized_question, k=k_vector)]
 
-            # Ключевой поиск с фильтрацией (только если self.splits не пуст)
+            # Ключевой поиск с фильтрацией и scoring
             keyword_docs = []
-            if self.splits:  # Проверяем что splits не пуст
+            if self.splits:
                 keywords = self._extract_keywords(normalized_question)
 
                 for doc in self.splits:
-                    # Применяем фильтр по разделу если указан
                     if section_filter and doc.metadata.get('section') != section_filter:
                         continue
 
                     doc_content_lower = doc.page_content.lower()
-                    if any(keyword in doc_content_lower for keyword in keywords):
-                        keyword_docs.append(doc)
+                    # Подсчет количества совпадающих ключевых слов для scoring
+                    matches = sum(1 for keyword in keywords if keyword in doc_content_lower)
+                    if matches > 0:
+                        score = matches / len(keywords)  # Нормализованный score
+                        keyword_docs.append((doc, score))
 
-            # Объединение результатов
+            # Объединение результатов с учетом scores
             unique_docs = {}
-            for doc in vector_docs + keyword_docs:
+            for doc, score in vector_docs + keyword_docs:
                 key = (doc.page_content, doc.metadata.get('page'), doc.metadata.get('section'))
-                unique_docs[key] = doc
+                if key not in unique_docs or score > unique_docs[key][1]:
+                    unique_docs[key] = (doc, score)
 
-            return list(unique_docs.values())[:8]
+            # Сортировка по релевантности и возврат топ k_final документов
+            sorted_docs = sorted(unique_docs.values(), key=lambda x: x[1], reverse=True)
+            return [doc for doc, _ in sorted_docs[:k_final]]
 
         except Exception as e:
             logger.error(f"Ошибка в гибридном поиске: {str(e)}", exc_info=True)
-            return vector_docs[:5] if 'vector_docs' in locals() else []
+            return [doc for doc, _ in vector_docs[:k_vector]] if 'vector_docs' in locals() else []
 
     def _extract_keywords(self, text: str):
-        """Извлечение ключевых слов с нормализацией"""
-        # Удаляем стоп-слова и оставляем только существенные слова
-        stop_words = {'и', 'в', 'на', 'с', 'по', 'к', 'у', 'о', 'из', 'что', 'как', 'кто', 'для', 'при'}
-        words = text.lower().split()
-        keywords = [word for word in words if len(word) > 3 and word not in stop_words]
+        """Улучшенное извлечение ключевых слов с нормализацией"""
+        # Расширенный список стоп-слов
+        stop_words = {
+            'и', 'в', 'на', 'с', 'по', 'к', 'у', 'о', 'из', 'что', 'как', 'кто', 'для', 'при',
+            'был', 'была', 'были', 'быть', 'есть', 'это', 'эти', 'тот', 'та', 'те', 'такой',
+            'где', 'когда', 'который', 'какой', 'чей', 'если', 'пока', 'пусть'
+        }
 
-        # Добавляем словоформы (простая стемминг-эмуляция для русского языка)
-        stemmed_keywords = []
+        # Токенизация с учетом имен собственных
+        words = []
+        for token in text.lower().split():
+            # Сохраняем имена собственные (слова с заглавной буквы)
+            if token in text.split() and token[0].isupper():
+                words.append(token)
+            else:
+                words.append(token.lower())
+
+        # Базовая фильтрация
+        keywords = [word for word in words if len(word) > 2 and word not in stop_words]
+
+        # Добавляем биграммы для имен собственных и важных словосочетаний
+        bigrams = []
+        for i in range(len(words) - 1):
+            if (words[i][0].isupper() and words[i+1][0].isupper()) or \
+               (words[i] + " " + words[i+1]).lower() in text.lower():
+                bigrams.append(words[i] + " " + words[i+1])
+
+        # Добавляем словоформы с учетом русской морфологии
+        morphological_variants = []
         for word in keywords:
-            stemmed_keywords.append(word)
-            # Добавляем вариант без окончания (очень упрощенный подход)
+            morphological_variants.append(word)
+            # Основные окончания существительных и прилагательных
             if len(word) > 5:
-                stemmed_keywords.append(word[:-1])  # Без последней буквы
-                stemmed_keywords.append(word[:-2])  # Без двух последних букв
+                for ending in ['ый', 'ая', 'ое', 'ые', 'ого', 'ему', 'ами', 'ями', 'ов', 'ев']:
+                    if word.endswith(ending):
+                        morphological_variants.append(word[:-len(ending)])
+                # Сохраняем корень слова (упрощенно)
+                morphological_variants.append(word[:5])
 
-        return stemmed_keywords
+        # Объединяем все варианты и удаляем дубликаты
+        all_keywords = list(set(keywords + bigrams + morphological_variants))
+
+        # Сортируем по длине (более длинные слова имеют больший приоритет)
+        return sorted(all_keywords, key=len, reverse=True)
 
     def _create_context_window(self, docs):
         """Создание контекстного окна с учетом окружающих фрагментов"""
@@ -677,29 +721,26 @@ class BookRAG:
         if section_filter:
             section_info = f"\n\nВнимание: Этот вопрос относится к разделу '{section_filter}' книги."
 
-        prompt_template = """Ты - эксперт по анализу бизнес-литературы.
-        Твоя задача - дать подробный, структурированный ответ на вопрос, используя ТОЛЬКО предоставленный контекст.
+        prompt_template = """Ты - специализированный ассистент по книге "Бизнес в диалоге: от малого к невозможному" Анвара Халикова.
+        Твоя главная задача - помогать читателям глубже понять содержание этой книги, отвечая на их вопросы, опираясь ИСКЛЮЧИТЕЛЬНО на информацию из книги.
 
-        ПРАВИЛА:
-        1. Используй ТОЛЬКО информацию из контекста
-        2. Структурируй ответ по пунктам, если это уместно
-        3. Цитируй важные части текста
-        4. Если информации недостаточно - честно признай это
-        5. Сохраняй деловой стиль общения
-        6. Проводи регистронезависимый поиск (игнорируй разницу между заглавными и строчными буквами)
-        7. ВАЖНО: Если вопрос не связан с содержанием книги (например, просьба написать код, приготовить рецепт,
-           рассказать о погоде, курсе валют, или выполнить любую другую задачу, не имеющую отношения к анализу
-           текста книги), вежливо откажись отвечать и объясни, что ты можешь помочь только с вопросами,
-           связанными с содержанием книги
-        8. Если в контексте есть информация из разных разделов книги, указывай это в ответе{section_info}
+        КЛЮЧЕВЫЕ ПРИНЦИПЫ РАБОТЫ:
+        1. Отвечай ТОЛЬКО на основе информации из предоставленного контекста книги
+        2. Если информации в контексте недостаточно или она отсутствует - честно сообщи об этом
+        3. Не придумывай и не добавляй информацию, которой нет в книге
+        4. Структурируй ответы по пунктам, если это уместно
+        5. Используй цитаты из книги для подтверждения важных моментов
+        6. Сохраняй деловой и дружелюбный стиль общения
+        7. ВАЖНО: Если вопрос не связан с содержанием книги, вежливо объясни, что ты специализируешься только на содержании книги "Бизнес в диалоге" и можешь отвечать только на вопросы по ней
+        8. При цитировании указывай раздел книги, откуда взята информация
 
-        КОНТЕКСТ:
+        КОНТЕКСТ ИЗ КНИГИ:
         {context}
 
         ВОПРОС:
         {question}
 
-        СТРУКТУРИРОВАННЫЙ ОТВЕТ:"""
+        ОТВЕТ НА ОСНОВЕ КНИГИ:"""
 
         return PromptTemplate(
             template=prompt_template,
