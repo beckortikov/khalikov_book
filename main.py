@@ -318,52 +318,57 @@ class BookRAG:
         return cleaned_documents
 
     def _create_hierarchical_chunks(self):
-        """Создание иерархических чанков разного размера"""
-        logger.debug("Создание иерархических чанков...")
+        """Создание чанков с семантическим разбиением"""
+        logger.debug("Создание семантических чанков...")
 
-        # Уменьшаем количество чанков для избежания лимитов API
-        # Большие чанки для контекста
-        large_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1500,  # Уменьшено для более точного поиска
-            chunk_overlap=500,  # Увеличено для лучшего сохранения контекста
+        # Семантические разделители в порядке приоритета
+        semantic_separators = [
+            "\n\n\n",  # Разделы
+            "\n\n",    # Параграфы
+            "Глава ",  # Структурные элементы
+            "Раздел ",
+            "Часть ",
+            ". ",      # Предложения (с проверкой пробела)
+            "? ",      # Вопросы
+            "! ",      # Восклицания
+            ": ",      # Определения
+            "; ",      # Части предложений
+            "\n",      # Строки
+        ]
+
+        # Создаем сплиттер с семантическими правилами
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=200,  # Увеличено для лучшего сохранения контекста
             length_function=len,
-            separators=["\n\n", "\n", ".", "!", "?", ";"]  # Добавлены умные разделители
+            separators=semantic_separators
         )
 
-        # Малые чанки для точного поиска
-        small_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,  # Уменьшено для поиска конкретных деталей
-            chunk_overlap=250,  # Увеличено для лучшего контекста
-            length_function=len,
-            separators=["\n\n", "\n", ".", "!", "?", ";"]  # Добавлены умные разделители
-        )
+        # Создаем чанки
+        chunks = []
+        for doc in self.documents:
+            # Разбиваем документ на чанки
+            doc_chunks = splitter.split_documents([doc])
 
-        large_chunks = large_splitter.split_documents(self.documents)
-        small_chunks = small_splitter.split_documents(self.documents)
+            # Обрабатываем каждый чанк
+            for i, chunk in enumerate(doc_chunks):
+                # Сохраняем метаданные
+                chunk.metadata['chunk_index'] = i
+                chunk.metadata['total_chunks'] = len(doc_chunks)
+                chunk.metadata['chunk_size'] = len(chunk.page_content)
 
-        # Добавляем метаданные о размере чанка
-        for chunk in large_chunks:
-            chunk.metadata['chunk_type'] = 'large'
-        for chunk in small_chunks:
-            chunk.metadata['chunk_type'] = 'small'
+                # Определяем тип чанка
+                if i == 0:
+                    chunk.metadata['chunk_type'] = 'start'
+                elif i == len(doc_chunks) - 1:
+                    chunk.metadata['chunk_type'] = 'end'
+                else:
+                    chunk.metadata['chunk_type'] = 'middle'
 
-        # Ограничиваем общее количество чанков если их слишком много
-        total_chunks = len(large_chunks) + len(small_chunks)
-        if total_chunks > 1000:  # Устанавливаем разумный лимит
-            logger.warning(f"Слишком много чанков ({total_chunks}), сокращаем количество")
+                chunks.append(chunk)
 
-            # Берем пропорционально меньше чанков
-            max_large = min(400, len(large_chunks))
-            max_small = min(600, len(small_chunks))
-
-            large_chunks = large_chunks[:max_large]
-            small_chunks = small_chunks[:max_small]
-
-            logger.info(f"Сокращено до: крупных={len(large_chunks)}, мелких={len(small_chunks)}")
-
-        all_chunks = large_chunks + small_chunks
-        logger.info(f"Создано {len(all_chunks)} чанков (крупных: {len(large_chunks)}, мелких: {len(small_chunks)})")
-        return all_chunks
+        logger.info(f"Создано {len(chunks)} семантических чанков")
+        return chunks
 
     def _create_or_load_vectorstore(self):
         """Создание или загрузка векторного хранилища с поддержкой Pinecone"""
@@ -585,38 +590,36 @@ class BookRAG:
         return None
 
     def _hybrid_search_with_filter(self, question: str, section_filter=None):
-        """Гибридный поиск с фильтрацией по разделам"""
+        """Улучшенный гибридный поиск"""
         try:
             normalized_question = question.lower()
 
-            # Увеличиваем количество результатов для лучшего охвата
-            k_vector = 10  # Увеличено с 5
-            k_final = 12   # Увеличено с 8
+            # Параметры поиска
+            k_vector = 8
+            k_final = 10
 
-            # Векторный поиск с scoring
+            # Векторный поиск
+            vector_docs = []
             if section_filter:
                 if hasattr(self.vectorstore, 'similarity_search_with_score'):
-                    # Для FAISS используем поиск с оценкой релевантности
-                    vector_results = self.vectorstore.similarity_search_with_score(normalized_question, k=k_vector)
-                    vector_docs = [(doc, score) for doc, score in vector_results
+                    results = self.vectorstore.similarity_search_with_score(normalized_question, k=k_vector)
+                    vector_docs = [(doc, score) for doc, score in results
                                  if doc.metadata.get('section') == section_filter][:k_vector]
                 else:
-                    # Для Pinecone используем фильтры
                     filter_dict = {"section": {"$eq": section_filter}}
-                    vector_docs = self.vectorstore.similarity_search(
+                    docs = self.vectorstore.similarity_search(
                         normalized_question,
                         k=k_vector,
                         filter=filter_dict
                     )
-                    vector_docs = [(doc, 1.0) for doc in vector_docs]  # Добавляем фиктивные scores
+                    vector_docs = [(doc, 1.0) for doc in docs]
             else:
                 if hasattr(self.vectorstore, 'similarity_search_with_score'):
-                    vector_results = self.vectorstore.similarity_search_with_score(normalized_question, k=k_vector)
-                    vector_docs = vector_results
+                    vector_docs = self.vectorstore.similarity_search_with_score(normalized_question, k=k_vector)
                 else:
                     vector_docs = [(doc, 1.0) for doc in self.vectorstore.similarity_search(normalized_question, k=k_vector)]
 
-            # Ключевой поиск с фильтрацией и scoring
+            # Ключевой поиск с улучшенным скорингом
             keyword_docs = []
             if self.splits:
                 keywords = self._extract_keywords(normalized_question)
@@ -626,72 +629,48 @@ class BookRAG:
                         continue
 
                     doc_content_lower = doc.page_content.lower()
-                    # Подсчет количества совпадающих ключевых слов для scoring
-                    matches = sum(1 for keyword in keywords if keyword in doc_content_lower)
+
+                    # Подсчет совпадений с учетом позиции в тексте
+                    matches = 0
+                    for keyword in keywords:
+                        if keyword in doc_content_lower:
+                            # Если ключевое слово ближе к началу чанка, оно важнее
+                            position = doc_content_lower.index(keyword) / len(doc_content_lower)
+                            matches += 1 * (1 - position * 0.5)  # Вес выше для слов в начале
+
                     if matches > 0:
-                        score = matches / len(keywords)  # Нормализованный score
-                        keyword_docs.append((doc, score))
+                        # Нормализуем score с учетом типа чанка
+                        base_score = matches / len(keywords)
+                        chunk_type_multiplier = {
+                            'start': 1.2,  # Повышаем вес начальных чанков
+                            'end': 1.1,    # Слегка повышаем вес конечных чанков
+                            'middle': 1.0
+                        }.get(doc.metadata.get('chunk_type', 'middle'), 1.0)
 
-            # Объединение результатов с учетом scores
+                        final_score = base_score * chunk_type_multiplier
+                        keyword_docs.append((doc, final_score))
+
+            # Объединение результатов с весами
             unique_docs = {}
-            for doc, score in vector_docs + keyword_docs:
+            for doc, score in vector_docs:
                 key = (doc.page_content, doc.metadata.get('page'), doc.metadata.get('section'))
-                if key not in unique_docs or score > unique_docs[key][1]:
-                    unique_docs[key] = (doc, score)
+                unique_docs[key] = (doc, score * 0.7)  # Вес для векторного поиска
 
-            # Сортировка по релевантности и возврат топ k_final документов
+            for doc, score in keyword_docs:
+                key = (doc.page_content, doc.metadata.get('page'), doc.metadata.get('section'))
+                if key in unique_docs:
+                    # Комбинируем scores если документ уже есть
+                    unique_docs[key] = (doc, unique_docs[key][1] + score * 0.3)
+                else:
+                    unique_docs[key] = (doc, score * 0.3)
+
+            # Сортировка и возврат результатов
             sorted_docs = sorted(unique_docs.values(), key=lambda x: x[1], reverse=True)
             return [doc for doc, _ in sorted_docs[:k_final]]
 
         except Exception as e:
             logger.error(f"Ошибка в гибридном поиске: {str(e)}", exc_info=True)
             return [doc for doc, _ in vector_docs[:k_vector]] if 'vector_docs' in locals() else []
-
-    def _extract_keywords(self, text: str):
-        """Улучшенное извлечение ключевых слов с нормализацией"""
-        # Расширенный список стоп-слов
-        stop_words = {
-            'и', 'в', 'на', 'с', 'по', 'к', 'у', 'о', 'из', 'что', 'как', 'кто', 'для', 'при',
-            'был', 'была', 'были', 'быть', 'есть', 'это', 'эти', 'тот', 'та', 'те', 'такой',
-            'где', 'когда', 'который', 'какой', 'чей', 'если', 'пока', 'пусть'
-        }
-
-        # Токенизация с учетом имен собственных
-        words = []
-        for token in text.lower().split():
-            # Сохраняем имена собственные (слова с заглавной буквы)
-            if token in text.split() and token[0].isupper():
-                words.append(token)
-            else:
-                words.append(token.lower())
-
-        # Базовая фильтрация
-        keywords = [word for word in words if len(word) > 2 and word not in stop_words]
-
-        # Добавляем биграммы для имен собственных и важных словосочетаний
-        bigrams = []
-        for i in range(len(words) - 1):
-            if (words[i][0].isupper() and words[i+1][0].isupper()) or \
-               (words[i] + " " + words[i+1]).lower() in text.lower():
-                bigrams.append(words[i] + " " + words[i+1])
-
-        # Добавляем словоформы с учетом русской морфологии
-        morphological_variants = []
-        for word in keywords:
-            morphological_variants.append(word)
-            # Основные окончания существительных и прилагательных
-            if len(word) > 5:
-                for ending in ['ый', 'ая', 'ое', 'ые', 'ого', 'ему', 'ами', 'ями', 'ов', 'ев']:
-                    if word.endswith(ending):
-                        morphological_variants.append(word[:-len(ending)])
-                # Сохраняем корень слова (упрощенно)
-                morphological_variants.append(word[:5])
-
-        # Объединяем все варианты и удаляем дубликаты
-        all_keywords = list(set(keywords + bigrams + morphological_variants))
-
-        # Сортируем по длине (более длинные слова имеют больший приоритет)
-        return sorted(all_keywords, key=len, reverse=True)
 
     def _create_context_window(self, docs):
         """Создание контекстного окна с учетом окружающих фрагментов"""
