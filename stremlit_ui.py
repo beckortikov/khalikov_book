@@ -1,8 +1,21 @@
 import streamlit as st
-from main import BookRAG
-import os
 import logging
+import sys
+import os
 
+# Добавляем путь к модулям
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from main import BookRAG
+
+# Константы безопасности
+MAX_QUESTION_LENGTH = 200
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 st.set_page_config(
@@ -124,44 +137,49 @@ for message_data in st.session_state.messages:
     )
 
 # Поле ввода
-if prompt := st.chat_input("Задайте вопрос о книге..."):
-    # Добавляем вопрос пользователя в историю
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    message(prompt, is_user=True)
+if prompt := st.chat_input(f"Задайте вопрос о книге (максимум {MAX_QUESTION_LENGTH} символов)..."):
+    # Валидация длины входного запроса для предотвращения промт-инжекшн
+    if len(prompt) > MAX_QUESTION_LENGTH:
+        st.error(f"❌ Вопрос слишком длинный ({len(prompt)} символов). Максимальная длина: {MAX_QUESTION_LENGTH} символов.")
+        st.info("💡 Пожалуйста, сократите ваш вопрос.")
+    else:
+        # Добавляем вопрос пользователя в историю
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        message(prompt, is_user=True)
 
-    try:
-        with st.spinner('Ищу ответ...'):
-            # Если выбран конкретный раздел
-            if selected_section != "Вся книга":
-                response = st.session_state.rag.search_by_section(selected_section, prompt)
-            else:
-                response = st.session_state.rag.ask_question(prompt)
+        try:
+            with st.spinner('Ищу ответ...'):
+                # Если выбран конкретный раздел
+                if selected_section != "Вся книга":
+                    response = st.session_state.rag.search_by_section(selected_section, prompt)
+                else:
+                    response = st.session_state.rag.ask_question(prompt)
 
-            # Разделяем ответ на основную часть и метаданные
-            parts = response.split("\n\nИсточники:")
-            main_answer = parts[0]
-            metadata = "Источники:" + parts[1] if len(parts) > 1 else ""
+                # Разделяем ответ на основную часть и метаданные
+                parts = response.split("\n\nИсточники:")
+                main_answer = parts[0]
+                metadata = "Источники:" + parts[1] if len(parts) > 1 else ""
 
-            # Формируем полный ответ с метаданными
-            full_response = f"{main_answer}\n\n<details><summary>Метаданные ответа</summary>{metadata}</details>"
+                # Формируем полный ответ с метаданными
+                full_response = f"{main_answer}\n\n<details><summary>Метаданные ответа</summary>{metadata}</details>"
 
-            # Добавляем ответ в историю
+                # Добавляем ответ в историю
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": full_response
+                })
+                message(full_response)
+
+                logger.info("Успешно получен ответ на вопрос")
+        except Exception as e:
+            error_msg = f"❌ Ошибка при обработке вопроса: {str(e)}"
+            logger.error(error_msg, exc_info=True)
             st.session_state.messages.append({
                 "role": "assistant",
-                "content": full_response
+                "content": error_msg,
+                "is_error": True
             })
-            message(full_response)
-
-            logger.info("Успешно получен ответ на вопрос")
-    except Exception as e:
-        error_msg = f"❌ Ошибка при обработке вопроса: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": error_msg,
-            "is_error": True
-        })
-        message(error_msg, is_error=True)
+            message(error_msg, is_error=True)
 
 # Добавляем краткую инструкцию
 with st.sidebar:

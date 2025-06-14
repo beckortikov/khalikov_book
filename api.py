@@ -8,6 +8,9 @@ import shutil
 from typing import Optional, List, Dict, Any
 from fastapi.middleware.cors import CORSMiddleware
 
+# Константы безопасности
+MAX_QUESTION_LENGTH = 200
+
 # Настройка логирования
 logging.basicConfig(
     level=logging.DEBUG,
@@ -87,6 +90,39 @@ async def ask_question(request: QuestionRequest):
         raise HTTPException(status_code=503, detail="Система не готова. Пожалуйста, повторите запрос позже.")
 
     try:
+        # Валидация длины входного запроса для предотвращения промт-инжекшн
+        if len(request.question) > MAX_QUESTION_LENGTH:
+            logger.warning(f"Получен слишком длинный запрос: {len(request.question)} символов")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Вопрос слишком длинный. Максимальная длина вопроса - {MAX_QUESTION_LENGTH} символов."
+            )
+
+        # Проверка на пустой запрос
+        if not request.question.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Вопрос не может быть пустым."
+            )
+
+        # Дополнительная проверка на подозрительные паттерны промт-инжекшн
+        suspicious_patterns = [
+            "ignore previous", "ignore above", "forget everything",
+            "system prompt", "system message", "you are now",
+            "act as", "pretend to be", "roleplay as",
+            "ignore all previous", "disregard previous",
+            "new instructions", "new rules", "new system"
+        ]
+
+        question_lower = request.question.lower()
+        for pattern in suspicious_patterns:
+            if pattern in question_lower:
+                logger.warning(f"Обнаружен подозрительный паттерн в запросе: {pattern}")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Обнаружен подозрительный паттерн в запросе. Пожалуйста, задайте вопрос о содержании книги."
+                )
+
         logger.debug(f"Получен вопрос: {request.question}")
         if request.section_filter:
             logger.debug(f"Фильтр по разделу: {request.section_filter}")
@@ -101,6 +137,8 @@ async def ask_question(request: QuestionRequest):
         logger.info("Успешно получен ответ на вопрос")
 
         return {"answer": response}
+    except HTTPException:
+        raise
     except Exception as e:
         error_msg = f"Ошибка при обработке вопроса: {str(e)}"
         logger.error(error_msg, exc_info=True)
@@ -227,12 +265,29 @@ async def search_in_section(request: SectionSearchRequest):
         raise HTTPException(status_code=503, detail="Система не готова. Пожалуйста, повторите запрос позже.")
 
     try:
+        # Валидация длины входного запроса для предотвращения промт-инжекшн
+        if len(request.query) > MAX_QUESTION_LENGTH:
+            logger.warning(f"Получен слишком длинный запрос для поиска по разделу: {len(request.query)} символов")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Запрос слишком длинный. Максимальная длина запроса - {MAX_QUESTION_LENGTH} символов."
+            )
+
+        # Проверка на пустой запрос
+        if not request.query.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Запрос не может быть пустым."
+            )
+
         logger.debug(f"Поиск в разделе: {request.section_name}, запрос: {request.query}")
 
         response = rag_instance.search_by_section(request.section_name, request.query)
         logger.info(f"Успешно выполнен поиск в разделе {request.section_name}")
 
         return {"answer": response}
+    except HTTPException:
+        raise
     except Exception as e:
         error_msg = f"Ошибка при поиске в разделе: {str(e)}"
         logger.error(error_msg, exc_info=True)

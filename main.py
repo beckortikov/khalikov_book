@@ -13,6 +13,9 @@ import glob
 from dotenv import load_dotenv
 from pinecone import Pinecone as PineconeClient
 
+# Константы безопасности
+MAX_QUESTION_LENGTH = 200
+
 load_dotenv()
 # Настройка логирования
 logging.basicConfig(
@@ -537,6 +540,28 @@ class BookRAG:
 
     def ask_question(self, question: str, section_filter=None) -> str:
         try:
+            # Валидация длины входного запроса для предотвращения промт-инжекшн
+            if len(question) > MAX_QUESTION_LENGTH:
+                return "Ошибка: Вопрос слишком длинный. Максимальная длина вопроса - 200 символов. Пожалуйста, сократите ваш вопрос."
+
+            # Проверка на пустой запрос
+            if not question.strip():
+                return "Ошибка: Вопрос не может быть пустым."
+
+            # Дополнительная проверка на подозрительные паттерны промт-инжекшн
+            suspicious_patterns = [
+                "ignore previous", "ignore above", "forget everything",
+                "system prompt", "system message", "you are now",
+                "act as", "pretend to be", "roleplay as",
+                "ignore all previous", "disregard previous",
+                "new instructions", "new rules", "new system"
+            ]
+
+            question_lower = question.lower()
+            for pattern in suspicious_patterns:
+                if pattern in question_lower:
+                    return "Ошибка: Обнаружен подозрительный паттерн в запросе. Пожалуйста, задайте вопрос о содержании книги."
+
             logger.debug(f"Обработка вопроса: {question}")
             if section_filter:
                 logger.debug(f"Фильтр по разделу: {section_filter}")
@@ -759,6 +784,10 @@ class BookRAG:
     def search_by_section(self, section_name: str, query: str = "") -> str:
         """Поиск информации в конкретном разделе книги"""
         try:
+            # Валидация длины входного запроса для предотвращения промт-инжекшн
+            if len(query) > MAX_QUESTION_LENGTH:
+                return "Ошибка: Запрос слишком длинный. Максимальная длина запроса - 200 символов. Пожалуйста, сократите ваш запрос."
+
             # Нормализуем название раздела
             section_key = section_name.lower().replace(' ', '_')
 

@@ -5,19 +5,22 @@ import time
 import json
 import os
 
-API_URL = "http://localhost:8001"  # Адрес API по умолчанию
+# Константы
+API_URL = "http://localhost:8000"
+MAX_QUESTION_LENGTH = 200
 
 def check_health():
     """Проверка статуса API"""
     try:
         response = requests.get(f"{API_URL}/health")
-        response.raise_for_status()
-        data = response.json()
-        print(f"Статус API: {data['status']}")
-        print(f"Сообщение: {data['message']}")
-        return data['status'] == 'ok'
+        if response.status_code == 200:
+            print("✅ API готово к работе")
+            return True
+        else:
+            print(f"❌ API недоступно. Статус: {response.status_code}")
+            return False
     except requests.RequestException as e:
-        print(f"Ошибка при проверке статуса API: {str(e)}")
+        print(f"❌ Ошибка подключения к API: {str(e)}")
         return False
 
 def upload_book(file_path):
@@ -48,6 +51,17 @@ def upload_book(file_path):
 def ask_question(question):
     """Задать вопрос API"""
     try:
+        # Валидация длины входного запроса для предотвращения промт-инжекшн
+        if len(question) > MAX_QUESTION_LENGTH:
+            print("❌ Ошибка: Вопрос слишком длинный. Максимальная длина вопроса - 200 символов.")
+            print(f"   Текущая длина: {len(question)} символов")
+            return False
+
+        # Проверка на пустой запрос
+        if not question.strip():
+            print("❌ Ошибка: Вопрос не может быть пустым.")
+            return False
+
         response = requests.post(
             f"{API_URL}/ask",
             json={"question": question}
@@ -77,6 +91,7 @@ def ask_question(question):
 def interactive_mode():
     """Интерактивный режим для задания вопросов"""
     print("Интерактивный режим (для выхода введите 'exit' или 'quit')")
+    print("⚠️  Максимальная длина вопроса: 200 символов")
 
     # Проверяем статус API
     if not check_health():
@@ -91,12 +106,18 @@ def interactive_mode():
         if not question.strip():
             continue
 
+        # Валидация длины в интерактивном режиме
+        if len(question) > MAX_QUESTION_LENGTH:
+            print(f"❌ Вопрос слишком длинный ({len(question)} символов). Максимум: 200 символов.")
+            print("   Пожалуйста, сократите ваш вопрос.")
+            continue
+
         ask_question(question)
 
 def main():
-    
+
     global API_URL
-    
+
     parser = argparse.ArgumentParser(description="Клиент для API книжного помощника")
 
     parser.add_argument('--url', default=None, help=f"URL API (по умолчанию: {API_URL})")
