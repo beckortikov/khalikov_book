@@ -15,4 +15,4 @@ requests==2.31.0
 pinecone==5.4.2
 pymupdf
 rank-bm25
-spacy
+aiofiles
