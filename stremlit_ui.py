@@ -119,7 +119,7 @@ with st.sidebar:
             "role": "assistant",
             "content": "👋 История очищена. Задайте мне новый вопрос о книге."
         }]
-        st.experimental_rerun()
+        st.rerun()
 
 # Основной интерфейс
 st.title("📚 Книжный помощник с RAG")
@@ -161,7 +161,10 @@ if prompt := st.chat_input(f"Задайте вопрос о книге (макс
                 metadata = "Источники:" + parts[1] if len(parts) > 1 else ""
 
                 # Формируем полный ответ с метаданными
-                full_response = f"{main_answer}\n\n<details><summary>Метаданные ответа</summary>{metadata}</details>"
+                if metadata:
+                    full_response = f"{main_answer}\n\n**Метаданные ответа:**\n{metadata}"
+                else:
+                    full_response = main_answer
 
                 # Добавляем ответ в историю
                 st.session_state.messages.append({
