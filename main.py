@@ -435,17 +435,25 @@ class BookRAG:
 
     def _split_complex_question(self, question: str):
         """Разбиение сложных вопросов на подзапросы"""
-        split_prompt = """Разбей сложный вопрос на простые подзапросы.
-        Вопрос: {question}
-        Ответ в формате JSON: { "subquestions": [...] }"""
-        chain = LLMChain(
-            llm=self.light_llm,
-            prompt=PromptTemplate(template=split_prompt, input_variables=["question"])
-        )
-        result = chain.run(question=question)
+        # Упрощаем - для большинства вопросов достаточно одного запроса
+        # Это устранит проблемы с парсингом JSON от LLM
         try:
-            return json.loads(result)["subquestions"]
-        except:
+            # Простая проверка - если вопрос содержит "и", "а также", "плюс" - можем разделить
+            if any(word in question.lower() for word in [" и ", " а также ", " плюс ", " кроме того "]):
+                # Простое разделение по союзам
+                parts = []
+                for separator in [" и ", " а также ", " плюс ", " кроме того "]:
+                    if separator in question.lower():
+                        parts = question.split(separator, 1)
+                        break
+
+                if len(parts) == 2:
+                    return [part.strip() for part in parts]
+
+            # В остальных случаях возвращаем исходный вопрос
+            return [question]
+        except Exception as e:
+            logger.warning(f"Ошибка при разделении вопроса: {e}")
             return [question]
 
     def ask_question(self, question: str, section_filter=None):
@@ -468,23 +476,38 @@ class BookRAG:
 
             logger.debug(f"Обработка вопроса: {question}")
             subquestions = self._split_complex_question(question)
-            answers = []
-            relevant_docs = []
 
-            for subq in subquestions:
-                docs = self._hybrid_search_with_filter(subq.lower(), section_filter)
+            # Если один вопрос - обрабатываем напрямую
+            if len(subquestions) == 1:
+                docs = self._hybrid_search_with_filter(question.lower(), section_filter)
                 if not docs:
-                    answers.append(f"Информация по подзапросу '{subq}' отсутствует.")
-                    continue
-                relevant_docs.extend(docs)
-                context = self._create_context_window(docs)
-                prompt = self._create_enhanced_prompt(subq, context, section_filter)
-                result = self.qa_chain({"question": prompt, "chat_history": self.chat_history})
-                answers.append(result["answer"])
-                self.chat_history.append((subq, result["answer"]))
+                    return "Информация по данному вопросу в книге отсутствует."
 
-            final_answer = "\n".join([f"Подзапрос {i+1}: {ans}" for i, ans in enumerate(answers)])
-            return self._post_process_answer(final_answer, relevant_docs)
+                context = self._create_context_window(docs)
+                prompt = self._create_enhanced_prompt(question, context, section_filter)
+                result = self.qa_chain({"question": prompt, "chat_history": self.chat_history})
+                self.chat_history.append((question, result["answer"]))
+                return self._post_process_answer(result["answer"], docs)
+
+            # Если несколько подвопросов
+            else:
+                answers = []
+                relevant_docs = []
+
+                for subq in subquestions:
+                    docs = self._hybrid_search_with_filter(subq.lower(), section_filter)
+                    if not docs:
+                        answers.append(f"Информация по подзапросу '{subq}' отсутствует.")
+                        continue
+                    relevant_docs.extend(docs)
+                    context = self._create_context_window(docs)
+                    prompt = self._create_enhanced_prompt(subq, context, section_filter)
+                    result = self.qa_chain({"question": prompt, "chat_history": self.chat_history})
+                    answers.append(result["answer"])
+                    self.chat_history.append((subq, result["answer"]))
+
+                final_answer = "\n".join([f"Часть {i+1}: {ans}" for i, ans in enumerate(answers)])
+                return self._post_process_answer(final_answer, relevant_docs)
 
         except Exception as e:
             error_msg = str(e)
