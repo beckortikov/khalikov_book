@@ -36,7 +36,9 @@ logger = logging.getLogger(__name__)
 
 # Загрузка переменных окружения
 load_dotenv()
-os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+openai_key = os.getenv("OPENAI_API_KEY")
+if openai_key:
+    os.environ["OPENAI_API_KEY"] = openai_key
 
 class BookRAG:
     def __init__(self, use_sections=True, pdf_directory="book"):
@@ -62,6 +64,13 @@ class BookRAG:
                 self.documents = []
                 self.splits = []
                 self.vectorstore = self._load_existing_vectorstore()
+                # Для гибридного поиска нужно загрузить документы для BM25
+                logger.info("Загружаем документы для BM25...")
+                if use_sections:
+                    self.documents = asyncio.run(self._load_all_sections())
+                else:
+                    self.documents = asyncio.run(self._load_full_book())
+                self.splits = self._create_hierarchical_chunks()
             else:
                 logger.info("Эмбеддинги не найдены. Загружаем PDF и создаем эмбеддинги.")
                 if use_sections:
@@ -478,8 +487,20 @@ class BookRAG:
             return self._post_process_answer(final_answer, relevant_docs)
 
         except Exception as e:
-            logger.error(f"Ошибка при обработке вопроса '{question}': {str(e)}", exc_info=True)
-            return f"Произошла ошибка: Не удалось обработать вопрос. Попробуйте переформулировать."
+            error_msg = str(e)
+            logger.error(f"Ошибка при обработке вопроса '{question}': {error_msg}", exc_info=True)
+
+            # Более конкретные сообщения об ошибках
+            if "openai" in error_msg.lower():
+                return f"Ошибка OpenAI API: {error_msg}. Проверьте API ключ."
+            elif "pinecone" in error_msg.lower():
+                return f"Ошибка Pinecone: {error_msg}. Проверьте настройки Pinecone."
+            elif "spacy" in error_msg.lower():
+                return f"Ошибка spaCy: {error_msg}. Установите модель командой: python -m spacy download ru_core_news_sm"
+            elif "splits" in error_msg.lower() or "list index" in error_msg.lower():
+                return f"Ошибка данных: {error_msg}. Попробуйте пересоздать эмбеддинги."
+            else:
+                return f"Произошла ошибка: {error_msg}. Попробуйте переформулировать вопрос."
 
     def _hybrid_search_with_filter(self, question: str, section_filter=None):
         """Гибридный поиск с BM25"""
@@ -494,6 +515,11 @@ class BookRAG:
                 )]
             else:
                 vector_docs = self.vectorstore.similarity_search_with_score(question, k=k_vector)
+
+            # Проверяем, что self.splits не пустой
+            if not self.splits:
+                logger.warning("self.splits пустой, используем только векторный поиск")
+                return [doc for doc, _ in vector_docs[:k_final]]
 
             tokenized_corpus = [doc.page_content.lower().split() for doc in self.splits]
             bm25 = BM25Okapi(tokenized_corpus)
