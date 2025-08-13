@@ -16,3 +16,4 @@ pinecone==5.4.2
 pymupdf
 rank-bm25
 aiofiles
+spacy>=3.7.0

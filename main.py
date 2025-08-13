@@ -243,7 +243,19 @@ class BookRAG:
     def _create_hierarchical_chunks(self):
         """Создание семантических чанков с использованием spacy"""
         logger.debug("Создание семантических чанков...")
-        nlp = spacy.load("ru_core_news_lg")  # Модель для русского языка
+
+        # Попытка загрузить русскую модель spaCy с fallback
+        try:
+            nlp = spacy.load("ru_core_news_lg")
+            logger.info("Загружена русская модель spaCy ru_core_news_lg")
+        except OSError:
+            logger.warning("Русская модель spaCy не найдена, попытка загрузить малую модель...")
+            try:
+                nlp = spacy.load("ru_core_news_sm")
+                logger.info("Загружена малая русская модель spaCy ru_core_news_sm")
+            except OSError:
+                logger.warning("Русские модели spaCy недоступны, используем базовую обработку текста")
+                nlp = None
 
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=800,
@@ -254,8 +266,18 @@ class BookRAG:
 
         chunks = []
         for doc in self.documents:
-            spacy_doc = nlp(doc.page_content)
-            sentences = [sent.text for sent in spacy_doc.sents]
+            # Если spaCy доступна, используем её для разделения на предложения
+            if nlp is not None:
+                try:
+                    spacy_doc = nlp(doc.page_content)
+                    sentences = [sent.text for sent in spacy_doc.sents]
+                except Exception as e:
+                    logger.warning(f"Ошибка spaCy: {e}, используем простое разделение")
+                    sentences = self._simple_sentence_split(doc.page_content)
+            else:
+                # Простое разделение на предложения без spaCy
+                sentences = self._simple_sentence_split(doc.page_content)
+
             current_chunk = ""
             current_length = 0
             chunk_index = 0
@@ -290,6 +312,15 @@ class BookRAG:
 
         logger.info(f"Создано {len(chunks)} семантических чанков")
         return chunks
+
+    def _simple_sentence_split(self, text):
+        """Простое разделение текста на предложения без spaCy"""
+        # Разделяем по основным знакам препинания
+        import re
+        sentences = re.split(r'[.!?]+\s+', text)
+        # Фильтруем пустые строки и очень короткие предложения
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
+        return sentences
 
     def _create_or_load_vectorstore(self):
         """Создание или загрузка векторного хранилища"""
