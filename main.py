@@ -484,6 +484,7 @@ class BookRAG:
                     return "Информация по данному вопросу в книге отсутствует."
 
                 context = self._create_context_window(docs)
+                logger.debug(f"Контекст для вопроса '{question}': {context[:500]}..." if len(context) > 500 else f"Контекст: {context}")
                 prompt = self._create_enhanced_prompt(question, context, section_filter)
                 result = self.qa_chain({"question": prompt, "chat_history": self.chat_history})
                 self.chat_history.append((question, result["answer"]))
@@ -501,6 +502,7 @@ class BookRAG:
                         continue
                     relevant_docs.extend(docs)
                     context = self._create_context_window(docs)
+                    logger.debug(f"Контекст для подвопроса '{subq}': {context[:300]}..." if len(context) > 300 else f"Контекст: {context}")
                     prompt = self._create_enhanced_prompt(subq, context, section_filter)
                     result = self.qa_chain({"question": prompt, "chat_history": self.chat_history})
                     answers.append(result["answer"])
@@ -576,22 +578,57 @@ class BookRAG:
             return [doc for doc, _ in vector_docs[:k_vector]] if vector_docs else []
 
     def _create_context_window(self, docs):
-        """Создание контекстного окна"""
+        """Создание контекстного окна с расширенным контекстом"""
         context_parts = []
+        processed_pages = set()
+
         for doc in docs:
             page_num = doc.metadata.get('page')
-            context_parts.extend([d.page_content for d in self.splits
-                                if d.metadata.get('page') == page_num])
-        return "\n\n".join(set(context_parts))
+            section = doc.metadata.get('section', '')
+
+            # Добавляем контекст с текущей страницы
+            if page_num not in processed_pages:
+                page_content = [d.page_content for d in self.splits
+                               if d.metadata.get('page') == page_num]
+                if page_content:
+                    context_parts.extend(page_content)
+                    processed_pages.add(page_num)
+
+            # Добавляем сам документ если он еще не включен
+            if doc.page_content not in context_parts:
+                context_parts.append(doc.page_content)
+
+        # Ограничиваем общий размер контекста
+        full_context = "\n\n".join(context_parts)
+        if len(full_context) > 4000:  # Ограничение для токенов
+            # Берем первые части, чтобы не превысить лимит
+            truncated_parts = []
+            current_length = 0
+            for part in context_parts:
+                if current_length + len(part) <= 4000:
+                    truncated_parts.append(part)
+                    current_length += len(part)
+                else:
+                    break
+            return "\n\n".join(truncated_parts)
+
+        return full_context
 
     def _create_enhanced_prompt(self, question: str, context: str, section_filter=None):
         """Создание улучшенного промпта"""
         section_info = f"\nРаздел: {section_filter}" if section_filter else ""
         prompt_template = """Ты - эксперт по книге "Бизнес в диалоге: от малого к невозможному" Анвара Халикова.
-Твоя задача - отвечать на вопросы, опираясь ТОЛЬКО на предоставленный контекст из книги.
-Если контекст не содержит ответа, скажи: "Информация по этому вопросу в книге отсутствует".
-Используй точные цитаты с указанием раздела и страницы, если возможно.
-Отвечай кратко, структурированно и на русском языке.
+
+ВАЖНО: Автор книги - Анвар Халиков. Если спрашивают об авторе, упомяни это.
+
+ИНСТРУКЦИИ:
+1. Внимательно изучи предоставленный контекст
+2. Найди информацию, которая отвечает на вопрос, даже если она выражена косвенно
+3. Если информация есть в контексте, используй её для ответа
+4. Если прямого ответа нет, но есть связанная информация - используй её
+5. Только если контекст совсем не содержит релевантной информации, скажи: "Информация по этому вопросу в книге отсутствует"
+
+Отвечай структурированно и полно на основе найденной информации.
 
 Контекст:
 {context}
