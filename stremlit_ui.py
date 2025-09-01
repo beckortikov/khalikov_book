@@ -73,14 +73,38 @@ def message(content, is_user=False, is_error=False):
 if 'messages' not in st.session_state:
     st.session_state.messages = []
 
+# Инициализация настроек если их нет
+if 'use_multi_vector' not in st.session_state:
+    st.session_state.use_multi_vector = False
+if 'use_sections' not in st.session_state:
+    st.session_state.use_sections = True
+
 if 'rag' not in st.session_state:
     try:
         with st.spinner('Инициализация системы...'):
             logger.info("Инициализация RAG при запуске...")
-            st.session_state.rag = BookRAG()
+            st.session_state.rag = BookRAG(
+                use_sections=st.session_state.use_sections,
+                use_multi_vector=st.session_state.use_multi_vector
+            )
+
+            # Приветственное сообщение с информацией о режиме
+            mode_info = []
+            if st.session_state.use_multi_vector:
+                mode_info.append("🚀 Multi-vector поиск")
+            mode_info.append("🔍 Гибридный BM25+Vector поиск")
+            mode_info.append("📊 Адаптивные веса")
+
+            greeting = f"""👋 Здравствуйте! Я ваш улучшенный книжный помощник.
+
+**Активные возможности:**
+{chr(10).join(['• ' + mode for mode in mode_info])}
+
+Задайте мне вопрос о книге, и я найду максимально релевантный ответ!"""
+
             st.session_state.messages.append({
                 "role": "assistant",
-                "content": "👋 Здравствуйте! Я ваш книжный помощник. Задайте мне вопрос о книге, и я постараюсь помочь вам найти ответ."
+                "content": greeting
             })
     except FileNotFoundError:
         st.error("Файл book.pdf не найден в директории приложения")
@@ -92,7 +116,60 @@ if 'rag' not in st.session_state:
 
 # Создаем боковую панель
 with st.sidebar:
-    st.header("Настройки")
+    st.header("⚙️ Настройки поиска")
+
+    # Секция режимов поиска
+    st.subheader("🔍 Режимы поиска")
+
+    # Переключатель multi-vector
+    new_multi_vector = st.checkbox(
+        "🚀 Multi-vector поиск",
+        value=st.session_state.use_multi_vector,
+        help="Включает создание нескольких векторов на документ для улучшения recall"
+    )
+
+    # Переключатель разделов
+    new_use_sections = st.checkbox(
+        "📖 Использовать разделы",
+        value=st.session_state.use_sections,
+        help="Загружает книгу по разделам для лучшей навигации"
+    )
+
+    # Проверяем, изменились ли настройки
+    settings_changed = (
+        new_multi_vector != st.session_state.use_multi_vector or
+        new_use_sections != st.session_state.use_sections
+    )
+
+    if settings_changed:
+        st.warning("⚠️ Настройки изменены. Нажмите 'Применить настройки' для перезапуска системы.")
+
+        if st.button("🔄 Применить настройки", type="primary"):
+            # Обновляем настройки
+            st.session_state.use_multi_vector = new_multi_vector
+            st.session_state.use_sections = new_use_sections
+
+            # Удаляем старый RAG объект
+            if 'rag' in st.session_state:
+                del st.session_state.rag
+
+            # Очищаем сообщения
+            st.session_state.messages = []
+
+            # Перезагружаем страницу
+            st.rerun()
+
+    # Информация о текущем режиме
+    st.info(f"""
+**Текущий режим:**
+• Multi-vector: {'✅' if st.session_state.use_multi_vector else '❌'}
+• Разделы: {'✅' if st.session_state.use_sections else '❌'}
+• Гибридный поиск: ✅
+• Адаптивные веса: ✅
+    """)
+
+    st.divider()
+    st.subheader("📚 Навигация по книге")
 
     # Получаем список доступных разделов
     available_sections = st.session_state.rag.get_available_sections()
@@ -121,12 +198,80 @@ with st.sidebar:
         }]
         st.rerun()
 
+    st.divider()
+
+    # Информация о новых возможностях
+    with st.expander("🚀 Новые возможности (Google Research)"):
+        st.markdown("""
+        **Проблема single-vector поиска:**
+        При большой базе знаний обычный векторный поиск не может найти все релевантные документы из-за ограничений размерности.
+
+        **Наши решения:**
+
+        🔍 **Гибридный поиск** - комбинирует:
+        • Dense vectors (семантическое понимание)
+        • Sparse BM25 (точное совпадение ключевых слов)
+
+        🚀 **Multi-vector** - создает:
+        • 3 вектора на документ вместо 1
+        • Лучшее покрытие семантического пространства
+
+        📊 **Адаптивные веса** - автоматически:
+        • Анализирует тип запроса
+        • Корректирует важность каждого метода поиска
+
+        📚 **Умный чанкинг** - создает:
+        • Чанки разных размеров (600/1000/1500)
+        • Умное перекрытие для лучшего контекста
+        """)
+
+    with st.expander("💡 Советы по использованию"):
+        st.markdown("""
+        **Для лучших результатов:**
+
+        🎯 **Точные вопросы:**
+        • "Что именно говорится о кризисе?"
+        • "Конкретные шаги командообразования"
+
+        🤔 **Концептуальные вопросы:**
+        • "Как работает управление командой?"
+        • "Почему важна структура бизнеса?"
+
+        🔍 **Используйте multi-vector для:**
+        • Сложных многоаспектных тем
+        • Поиска скрытых связей
+        • Улучшения полноты ответов
+        """)
+
+    # Статистика производительности
+    if st.session_state.get('rag') and hasattr(st.session_state.rag, 'splits'):
+        total_chunks = len(st.session_state.rag.splits) if st.session_state.rag.splits else 0
+        st.metric("📊 Чанков в базе", total_chunks)
+        if st.session_state.use_multi_vector and st.session_state.rag.multi_vector_embeddings:
+            vectors_count = total_chunks * 3  # 3 вектора на чанк
+            st.metric("🚀 Multi-векторов", vectors_count)
+
 # Основной интерфейс
 st.title("📚 Книжный помощник с RAG")
 
+# Показываем активные режимы в основном интерфейсе
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    if st.session_state.use_multi_vector:
+        st.success("🚀 Multi-vector активен")
+    else:
+        st.info("🔍 Single-vector режим")
+
+with col2:
+    st.success("📊 Адаптивные веса")
+
+with col3:
+    st.success("🔍 Гибридный BM25+Vector")
+
 # Если выбран конкретный раздел, показываем информацию
 if selected_section != "Вся книга":
-    st.info(f"🔍 Поиск осуществляется в разделе: {selected_section}")
+    st.info(f"📖 Поиск в разделе: **{selected_section}**")
 
 # Отображаем историю сообщений
 for message_data in st.session_state.messages:
@@ -188,12 +333,21 @@ if prompt := st.chat_input(f"Задайте вопрос о книге (макс
 with st.sidebar:
     with st.expander("ℹ️ Как пользоваться"):
         st.markdown("""
-        1. Выберите раздел книги в боковой панели (или оставьте "Вся книга" для поиска по всему тексту)
-        2. Введите ваш вопрос в поле внизу экрана
-        3. Получите структурированный ответ с указанием источников
+        **Быстрый старт:**
+        1. 🚀 Включите Multi-vector для лучшего поиска
+        2. 📖 Выберите раздел книги или "Вся книга"
+        3. ❓ Задайте вопрос в поле внизу
+        4. 📋 Получите улучшенный ответ с источниками
 
         **Примеры вопросов:**
-        - "Что такое ключевой фактор успеха?"
-        - "Расскажи о структуре команды"
-        - "Как справляться с кризисом в бизнесе?"
+
+        *Точные запросы:*
+        - "Что именно говорится о ключевом факторе успеха?"
+        - "Конкретные этапы командообразования"
+
+        *Концептуальные запросы:*
+        - "Как работает управление в кризисе?"
+        - "Почему важна организационная структура?"
+
+        **💡 Совет:** Multi-vector режим особенно эффективен для сложных вопросов!
         """)

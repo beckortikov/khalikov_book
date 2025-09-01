@@ -19,6 +19,8 @@ from pinecone import Pinecone as PineconeClient
 from rank_bm25 import BM25Okapi
 import spacy
 import numpy as np
+from typing import List, Tuple, Dict
+from sklearn.metrics.pairwise import cosine_similarity
 
 # Константы безопасности
 MAX_QUESTION_LENGTH = 200
@@ -41,11 +43,13 @@ if openai_key:
     os.environ["OPENAI_API_KEY"] = openai_key
 
 class BookRAG:
-    def __init__(self, use_sections=True, pdf_directory="book"):
+    def __init__(self, use_sections=True, pdf_directory="book", use_multi_vector=False):
         try:
-            logger.debug(f"Начало инициализации RAG с использованием разделов: {use_sections}")
+            logger.debug(f"Начало инициализации RAG с использованием разделов: {use_sections}, multi-vector: {use_multi_vector}")
             self.use_sections = use_sections
             self.pdf_directory = pdf_directory
+            self.use_multi_vector = use_multi_vector
+            self.multi_vector_embeddings = None
             self.sections_mapping = self._get_sections_mapping()
 
             # Инициализация Pinecone
@@ -250,8 +254,8 @@ class BookRAG:
         return all_documents
 
     def _create_hierarchical_chunks(self):
-        """Создание семантических чанков с использованием spacy"""
-        logger.debug("Создание семантических чанков...")
+        """Создание улучшенных семантических чанков с multiple размерами для преодоления ограничений single-vector"""
+        logger.debug("Создание улучшенных семантических чанков...")
 
         # Попытка загрузить русскую модель spaCy с fallback
         try:
@@ -266,61 +270,136 @@ class BookRAG:
                 logger.warning("Русские модели spaCy недоступны, используем базовую обработку текста")
                 nlp = None
 
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=200,
-            length_function=len,
-            separators=["\n\n\n", "\n\n", "Глава ", "Раздел ", "Часть ", ". ", "? ", "! ", ": ", "; ", "\n"]
-        )
+        # Создаем чанки разных размеров для лучшего покрытия
+        chunk_configs = [
+            {"size": 600, "overlap": 150, "type": "small"},    # Для детальных вопросов
+            {"size": 1000, "overlap": 250, "type": "medium"},  # Базовые чанки
+            {"size": 1500, "overlap": 400, "type": "large"},   # Для контекстных вопросов
+        ]
 
-        chunks = []
-        for doc in self.documents:
-            # Если spaCy доступна, используем её для разделения на предложения
-            if nlp is not None:
-                try:
-                    spacy_doc = nlp(doc.page_content)
-                    sentences = [sent.text for sent in spacy_doc.sents]
-                except Exception as e:
-                    logger.warning(f"Ошибка spaCy: {e}, используем простое разделение")
+        all_chunks = []
+
+        for config in chunk_configs:
+            logger.debug(f"Создание чанков размера {config['size']} с перекрытием {config['overlap']}")
+
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=config["size"],
+                chunk_overlap=config["overlap"],
+                length_function=len,
+                separators=["\n\n\n", "\n\n", "Глава ", "Раздел ", "Часть ", ". ", "? ", "! ", ": ", "; ", "\n"]
+            )
+
+            chunks = []
+            for doc in self.documents:
+                # Если spaCy доступна, используем её для разделения на предложения
+                if nlp is not None:
+                    try:
+                        spacy_doc = nlp(doc.page_content)
+                        sentences = [sent.text for sent in spacy_doc.sents]
+                    except Exception as e:
+                        logger.warning(f"Ошибка spaCy: {e}, используем простое разделение")
+                        sentences = self._simple_sentence_split(doc.page_content)
+                else:
+                    # Простое разделение на предложения без spaCy
                     sentences = self._simple_sentence_split(doc.page_content)
-            else:
-                # Простое разделение на предложения без spaCy
-                sentences = self._simple_sentence_split(doc.page_content)
 
-            current_chunk = ""
-            current_length = 0
-            chunk_index = 0
+                current_chunk = ""
+                current_length = 0
+                chunk_index = 0
 
-            for sent in sentences:
-                sent_len = len(sent)
-                if current_length + sent_len > 800:
+                for sent in sentences:
+                    sent_len = len(sent)
+                    if current_length + sent_len > config["size"]:
+                        if current_chunk.strip():  # Проверяем что чанк не пустой
+                            chunk_metadata = doc.metadata.copy()
+                            chunk_metadata.update({
+                                "chunk_index": chunk_index,
+                                "chunk_size": current_length,
+                                "chunk_type": self._determine_chunk_type(chunk_index, len(sentences)),
+                                "chunk_size_category": config["type"],
+                                "chunk_config_size": config["size"]
+                            })
+                            chunks.append(Document(page_content=current_chunk.strip(), metadata=chunk_metadata))
+
+                        # Создаем перекрытие с предыдущим чанком
+                        overlap_text = self._create_overlap(current_chunk, config["overlap"])
+                        current_chunk = overlap_text + " " + sent
+                        current_length = len(current_chunk)
+                        chunk_index += 1
+                    else:
+                        current_chunk += " " + sent if current_chunk else sent
+                        current_length += sent_len
+
+                # Добавляем последний чанк
+                if current_chunk.strip():
                     chunk_metadata = doc.metadata.copy()
                     chunk_metadata.update({
                         "chunk_index": chunk_index,
-                        "total_chunks": len(sentences),
                         "chunk_size": current_length,
-                        "chunk_type": "middle" if chunk_index > 0 else "start"
+                        "chunk_type": self._determine_chunk_type(chunk_index, chunk_index + 1),
+                        "chunk_size_category": config["type"],
+                        "chunk_config_size": config["size"]
                     })
                     chunks.append(Document(page_content=current_chunk.strip(), metadata=chunk_metadata))
-                    current_chunk = sent
-                    current_length = sent_len
-                    chunk_index += 1
+
+            all_chunks.extend(chunks)
+            logger.debug(f"Создано {len(chunks)} чанков размера {config['type']}")
+
+        # Удаляем дубликаты на основе содержимого и метаданных
+        unique_chunks = self._deduplicate_chunks(all_chunks)
+
+        logger.info(f"Создано {len(unique_chunks)} уникальных семантических чанков ({len(all_chunks)} до дедупликации)")
+        return unique_chunks
+
+    def _determine_chunk_type(self, chunk_index: int, total_chunks: int) -> str:
+        """Определяет тип чанка на основе позиции"""
+        if chunk_index == 0:
+            return "start"
+        elif chunk_index == total_chunks - 1:
+            return "end"
+        else:
+            return "middle"
+
+    def _create_overlap(self, text: str, overlap_size: int) -> str:
+        """Создает перекрытие заданного размера с конца текста"""
+        if len(text) <= overlap_size:
+            return text
+
+        # Находим хорошую точку разрыва (конец предложения)
+        sentences = text.split('. ')
+        if len(sentences) > 1:
+            # Берем последние предложения, которые помещаются в overlap_size
+            overlap_text = ""
+            for sentence in reversed(sentences[-3:]):  # Берем максимум 3 последних предложения
+                candidate = sentence + ". " + overlap_text
+                if len(candidate) <= overlap_size:
+                    overlap_text = candidate
                 else:
-                    current_chunk += " " + sent
-                    current_length += sent_len
+                    break
+            return overlap_text.strip()
+        else:
+            # Если предложений мало, берем последние overlap_size символов
+            return text[-overlap_size:].strip()
 
-            if current_chunk:
-                chunk_metadata = doc.metadata.copy()
-                chunk_metadata.update({
-                    "chunk_index": chunk_index,
-                    "total_chunks": chunk_index + 1,
-                    "chunk_size": current_length,
-                    "chunk_type": "end" if chunk_index > 0 else "start"
-                })
-                chunks.append(Document(page_content=current_chunk.strip(), metadata=chunk_metadata))
+    def _deduplicate_chunks(self, chunks: List[Document]) -> List[Document]:
+        """Удаляет дублирующиеся чанки на основе содержимого"""
+        seen_content = set()
+        unique_chunks = []
 
-        logger.info(f"Создано {len(chunks)} семантических чанков")
-        return chunks
+        for chunk in chunks:
+            # Создаем ключ на основе содержимого и страницы
+            content_key = (
+                chunk.page_content[:100],  # Первые 100 символов для быстрого сравнения
+                chunk.metadata.get('page', 0),
+                chunk.metadata.get('section', ''),
+                chunk.metadata.get('chunk_size_category', '')
+            )
+
+            if content_key not in seen_content:
+                seen_content.add(content_key)
+                unique_chunks.append(chunk)
+
+        return unique_chunks
 
     def _simple_sentence_split(self, text):
         """Простое разделение текста на предложения без spaCy"""
@@ -426,6 +505,20 @@ class BookRAG:
         logger.debug("Инициализация моделей...")
         self.llm = ChatOpenAI(model_name="gpt-4o", temperature=0)
         self.light_llm = ChatOpenAI(model_name="gpt-4o", temperature=0.2)
+
+        # Инициализация multi-vector подхода если включен
+        if self.use_multi_vector:
+            logger.info("Инициализация multi-vector подхода...")
+            base_embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
+            self.multi_vector_embeddings = MultiVectorEmbeddings(base_embeddings, num_vectors=3)
+
+            # Создаем multi-vector эмбеддинги для всех документов
+            if self.splits:
+                texts = [doc.page_content for doc in self.splits]
+                logger.info(f"Создание multi-vector эмбеддингов для {len(texts)} документов...")
+                self.multi_vector_embeddings.embed_documents(texts)
+                logger.info("Multi-vector эмбеддинги созданы")
+
         self.qa_chain = ConversationalRetrievalChain.from_llm(
             self.llm,
             retriever=self.vectorstore.as_retriever(search_kwargs={"k": 5}),
@@ -528,11 +621,18 @@ class BookRAG:
                 return f"Произошла ошибка: {error_msg}. Попробуйте переформулировать вопрос."
 
     def _hybrid_search_with_filter(self, question: str, section_filter=None):
-        """Гибридный поиск с BM25"""
+        """Улучшенный гибридный поиск с учетом ограничений single-vector подхода"""
         try:
-            k_vector = 8
-            k_final = 10
+            # Увеличиваем количество документов для лучшего покрытия
+            k_vector = 15
+            k_bm25 = 20
+            k_multi_vector = 12
+            k_final = 15
+
             vector_docs = []
+            multi_vector_docs = []
+
+            # Обычный векторный поиск
             if section_filter:
                 filter_dict = {"section": {"$eq": section_filter}}
                 vector_docs = [(doc, 1.0) for doc in self.vectorstore.similarity_search(
@@ -541,41 +641,189 @@ class BookRAG:
             else:
                 vector_docs = self.vectorstore.similarity_search_with_score(question, k=k_vector)
 
+            # Multi-vector поиск если включен
+            if self.use_multi_vector and self.multi_vector_embeddings:
+                logger.debug("Выполняется multi-vector поиск...")
+                # Фильтруем документы по разделу если нужно
+                filtered_docs = self.splits
+                if section_filter:
+                    filtered_docs = [doc for doc in self.splits if doc.metadata.get('section') == section_filter]
+
+                multi_vector_results = self.multi_vector_embeddings.similarity_search(
+                    question, filtered_docs, k=k_multi_vector
+                )
+                multi_vector_docs = multi_vector_results
+
             # Проверяем, что self.splits не пустой
             if not self.splits:
                 logger.warning("self.splits пустой, используем только векторный поиск")
                 return [doc for doc, _ in vector_docs[:k_final]]
 
-            tokenized_corpus = [doc.page_content.lower().split() for doc in self.splits]
-            bm25 = BM25Okapi(tokenized_corpus)
-            tokenized_query = question.split()
+            # Улучшенная токенизация для русского языка
+            tokenized_corpus = [self._advanced_tokenize(doc.page_content.lower()) for doc in self.splits]
+
+            # Настройка BM25 для русского языка
+            bm25 = BM25Okapi(tokenized_corpus, k1=1.5, b=0.75)
+            tokenized_query = self._advanced_tokenize(question.lower())
             bm25_scores = bm25.get_scores(tokenized_query)
 
             keyword_docs = []
-            for idx, score in enumerate(bm25_scores):
-                if score > 0 and (not section_filter or self.splits[idx].metadata.get('section') == section_filter):
+            # Сортируем по BM25 скорам и берем топ результаты
+            scored_indices = [(idx, score) for idx, score in enumerate(bm25_scores) if score > 0]
+            scored_indices.sort(key=lambda x: x[1], reverse=True)
+
+            for idx, score in scored_indices[:k_bm25]:
+                if not section_filter or self.splits[idx].metadata.get('section') == section_filter:
+                    # Увеличиваем бонус для разных типов чанков
                     chunk_type_multiplier = {
-                        'start': 1.2, 'end': 1.1, 'middle': 1.0
+                        'start': 1.3, 'end': 1.2, 'middle': 1.0
                     }.get(self.splits[idx].metadata.get('chunk_type', 'middle'), 1.0)
-                    keyword_docs.append((self.splits[idx], score * chunk_type_multiplier))
+
+                    # Бонус для точного совпадения ключевых слов
+                    exact_match_bonus = 1.0
+                    doc_lower = self.splits[idx].page_content.lower()
+                    query_words = tokenized_query
+                    exact_matches = sum(1 for word in query_words if word in doc_lower)
+                    if exact_matches > 0:
+                        exact_match_bonus = 1.0 + (exact_matches / len(query_words)) * 0.5
+
+                    final_score = score * chunk_type_multiplier * exact_match_bonus
+                    keyword_docs.append((self.splits[idx], final_score))
+
+            # Вычисляем адаптивные веса на основе характеристик запроса
+            # Это критично для преодоления фундаментальных ограничений single-vector подхода
+            adaptive_weights = self._calculate_adaptive_weights(question, vector_docs, keyword_docs, multi_vector_docs)
 
             unique_docs = {}
+
+            # 1. Векторный поиск с адаптивным весом
             for doc, score in vector_docs:
                 key = (doc.page_content, doc.metadata.get('page'), doc.metadata.get('section'))
-                unique_docs[key] = (doc, score * 0.7)
+                unique_docs[key] = (doc, score * adaptive_weights['vector'])
+
+            # 2. Multi-vector поиск с адаптивным весом
+            if self.use_multi_vector and multi_vector_docs:
+                logger.debug(f"Добавляем {len(multi_vector_docs)} multi-vector результатов")
+                for doc, score in multi_vector_docs:
+                    key = (doc.page_content, doc.metadata.get('page'), doc.metadata.get('section'))
+                    if key in unique_docs:
+                        unique_docs[key] = (doc, unique_docs[key][1] + score * adaptive_weights['multi_vector'])
+                    else:
+                        unique_docs[key] = (doc, score * adaptive_weights['multi_vector'])
+
+            # 3. BM25 с адаптивным весом (обычно наибольший для sparse search)
             for doc, score in keyword_docs:
                 key = (doc.page_content, doc.metadata.get('page'), doc.metadata.get('section'))
                 if key in unique_docs:
-                    unique_docs[key] = (doc, unique_docs[key][1] + score * 0.3)
+                    # Если документ найден несколькими методами - комбинируем скоры
+                    unique_docs[key] = (doc, unique_docs[key][1] + score * adaptive_weights['bm25'])
                 else:
-                    unique_docs[key] = (doc, score * 0.3)
+                    unique_docs[key] = (doc, score * adaptive_weights['bm25'])
 
+            # Дополнительное ранжирование по релевантности
             sorted_docs = sorted(unique_docs.values(), key=lambda x: x[1], reverse=True)
-            return [doc for doc, _ in sorted_docs[:k_final]]
+
+            # Применяем дополнительную фильтрацию по минимальному скору
+            min_threshold = 0.1
+            filtered_docs = [(doc, score) for doc, score in sorted_docs if score >= min_threshold]
+
+            return [doc for doc, _ in filtered_docs[:k_final]]
 
         except Exception as e:
             logger.error(f"Ошибка в гибридном поиске: {str(e)}", exc_info=True)
             return [doc for doc, _ in vector_docs[:k_vector]] if vector_docs else []
+
+    def _advanced_tokenize(self, text):
+        """Улучшенная токенизация для русского языка"""
+        # Удаляем знаки препинания и разделяем по пробелам
+        import re
+        # Сохраняем важные знаки препинания как отдельные токены
+        text = re.sub(r'([.!?,:;])', r' \1 ', text)
+        tokens = text.split()
+
+        # Фильтруем слишком короткие токены и стоп-слова
+        stop_words = {'и', 'в', 'на', 'с', 'по', 'для', 'от', 'до', 'при', 'о', 'об', 'что', 'как', 'так', 'это', 'то', 'же', 'но', 'или', 'а', 'да', 'нет'}
+        filtered_tokens = [token for token in tokens if len(token) > 2 and token.lower() not in stop_words]
+
+        return filtered_tokens
+
+    def _calculate_adaptive_weights(self, question: str, vector_docs: List, keyword_docs: List, multi_vector_docs: List = None) -> Dict[str, float]:
+        """Вычисляет адаптивные веса на основе характеристик запроса и результатов поиска"""
+
+        # Анализ характеристик запроса
+        question_lower = question.lower()
+        question_words = self._advanced_tokenize(question_lower)
+
+        # 1. Определяем тип запроса
+        exact_match_indicators = ['точно', 'именно', 'конкретно', 'определенно', 'четко']
+        conceptual_indicators = ['как', 'почему', 'зачем', 'что такое', 'объясни', 'расскажи']
+
+        is_exact_query = any(indicator in question_lower for indicator in exact_match_indicators)
+        is_conceptual_query = any(indicator in question_lower for indicator in conceptual_indicators)
+
+        # 2. Анализируем длину запроса (короткие запросы лучше для BM25)
+        query_length_factor = min(len(question_words) / 10.0, 1.0)  # Нормализуем к [0, 1]
+
+        # 3. Анализируем пересечение результатов
+        vector_content = set()
+        keyword_content = set()
+        multi_vector_content = set()
+
+        for doc, _ in vector_docs:
+            vector_content.add(doc.page_content[:100])  # Первые 100 символов как идентификатор
+
+        for doc, _ in keyword_docs:
+            keyword_content.add(doc.page_content[:100])
+
+        if multi_vector_docs:
+            for doc, _ in multi_vector_docs:
+                multi_vector_content.add(doc.page_content[:100])
+
+        # Вычисляем пересечения
+        vector_keyword_overlap = len(vector_content & keyword_content) / max(len(vector_content), 1)
+
+        # 4. Вычисляем адаптивные веса
+        base_weights = {
+            'vector': 0.3,
+            'multi_vector': 0.4 if self.use_multi_vector else 0.0,
+            'bm25': 0.5 if self.use_multi_vector else 0.6
+        }
+
+        # Корректировки весов
+        if is_exact_query:
+            # Для точных запросов увеличиваем вес BM25
+            base_weights['bm25'] *= 1.3
+            base_weights['vector'] *= 0.8
+        elif is_conceptual_query:
+            # Для концептуальных запросов увеличиваем вес vector/multi-vector
+            base_weights['vector'] *= 1.2
+            if self.use_multi_vector:
+                base_weights['multi_vector'] *= 1.2
+            base_weights['bm25'] *= 0.9
+
+        # Корректировка на основе длины запроса
+        if query_length_factor < 0.3:  # Короткий запрос
+            base_weights['bm25'] *= 1.2
+        elif query_length_factor > 0.7:  # Длинный запрос
+            base_weights['vector'] *= 1.1
+            if self.use_multi_vector:
+                base_weights['multi_vector'] *= 1.1
+
+        # Корректировка на основе пересечения результатов
+        if vector_keyword_overlap > 0.7:  # Высокое пересечение - можем доверять обоим
+            base_weights['vector'] *= 1.1
+            base_weights['bm25'] *= 1.1
+        elif vector_keyword_overlap < 0.3:  # Низкое пересечение - предпочитаем sparse
+            base_weights['bm25'] *= 1.2
+            base_weights['vector'] *= 0.9
+
+        # Нормализация весов
+        total_weight = sum(base_weights.values())
+        normalized_weights = {k: v / total_weight for k, v in base_weights.items()}
+
+        logger.debug(f"Адаптивные веса для запроса '{question[:50]}...': {normalized_weights}")
+
+        return normalized_weights
 
     def _create_context_window(self, docs):
         """Создание контекстного окна с расширенным контекстом"""
@@ -721,3 +969,193 @@ class BookRAG:
             results.append({"question": test["question"], "passed": passed, "answer": answer})
             logger.info(f"Тест: {test['question']} - {'Пройден' if passed else 'Не пройден'}")
         return results
+
+
+class MultiVectorEmbeddings:
+    """
+    Класс для реализации multi-vector подхода, преодолевающего ограничения single-vector
+    Создает несколько векторов для каждого документа для улучшения покрытия семантического пространства
+    """
+
+    def __init__(self, base_embeddings: OpenAIEmbeddings, num_vectors: int = 3):
+        self.base_embeddings = base_embeddings
+        self.num_vectors = num_vectors
+        self.doc_embeddings = {}  # {doc_id: [vector1, vector2, ...]}
+        self.doc_texts = {}       # {doc_id: text}
+
+    def embed_documents(self, texts: List[str]) -> List[List[List[float]]]:
+        """Создает multiple векторы для каждого документа"""
+        all_multi_embeddings = []
+
+        for doc_idx, text in enumerate(texts):
+            doc_vectors = self._create_multiple_vectors(text, doc_idx)
+            all_multi_embeddings.append(doc_vectors)
+
+        return all_multi_embeddings
+
+    def _create_multiple_vectors(self, text: str, doc_id: int) -> List[List[float]]:
+        """Создает несколько векторов для одного документа разными способами"""
+        vectors = []
+
+        # 1. Базовый эмбеддинг всего текста
+        base_vector = self.base_embeddings.embed_query(text)
+        vectors.append(base_vector)
+
+        # 2. Эмбеддинг первой половины
+        mid_point = len(text) // 2
+        first_half = text[:mid_point]
+        if len(first_half.strip()) > 50:  # Только если достаточно текста
+            first_vector = self.base_embeddings.embed_query(first_half)
+            vectors.append(first_vector)
+        else:
+            vectors.append(base_vector)  # Дублируем базовый если мало текста
+
+        # 3. Эмбеддинг второй половины
+        second_half = text[mid_point:]
+        if len(second_half.strip()) > 50:
+            second_vector = self.base_embeddings.embed_query(second_half)
+            vectors.append(second_vector)
+        else:
+            vectors.append(base_vector)
+
+        # 4. Если нужно больше векторов - создаем их через ключевые предложения
+        if self.num_vectors > 3:
+            key_sentences = self._extract_key_sentences(text)
+            for i, sentence in enumerate(key_sentences[:self.num_vectors-3]):
+                if len(sentence.strip()) > 30:
+                    sent_vector = self.base_embeddings.embed_query(sentence)
+                    vectors.append(sent_vector)
+                else:
+                    vectors.append(base_vector)
+
+        # Сохраняем информацию о документе
+        self.doc_embeddings[doc_id] = vectors
+        self.doc_texts[doc_id] = text
+
+        return vectors[:self.num_vectors]
+
+    def _extract_key_sentences(self, text: str) -> List[str]:
+        """Извлекает ключевые предложения из текста"""
+        import re
+
+        # Простое разделение на предложения
+        sentences = re.split(r'[.!?]+', text)
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 30]
+
+        # Берем самые длинные предложения как наиболее информативные
+        sentences.sort(key=len, reverse=True)
+
+        return sentences[:5]  # Максимум 5 ключевых предложений
+
+    def similarity_search(self, query: str, documents: List[Document], k: int = 10) -> List[Tuple[Document, float]]:
+        """Поиск с использованием multi-vector подхода"""
+        query_vector = self.base_embeddings.embed_query(query)
+
+        doc_scores = []
+
+        for doc_idx, doc in enumerate(documents):
+            if doc_idx in self.doc_embeddings:
+                # Вычисляем similarity с каждым вектором документа
+                doc_vectors = self.doc_embeddings[doc_idx]
+                similarities = []
+
+                for vector in doc_vectors:
+                    # Используем cosine similarity
+                    sim = cosine_similarity([query_vector], [vector])[0][0]
+                    similarities.append(sim)
+
+                # Используем максимальную similarity (ColBERT-style)
+                max_sim = max(similarities)
+
+                # Альтернативно: средняя similarity
+                # avg_sim = np.mean(similarities)
+
+                # Можно также использовать взвешенную сумму
+                # weights = [0.5, 0.3, 0.2]  # Больший вес базовому вектору
+                # weighted_sim = sum(w * s for w, s in zip(weights, similarities))
+
+                doc_scores.append((doc, max_sim))
+            else:
+                # Fallback на обычный single vector для документов без multi-vector
+                single_vector = self.base_embeddings.embed_query(doc.page_content)
+                sim = cosine_similarity([query_vector], [single_vector])[0][0]
+                doc_scores.append((doc, sim))
+
+        # Сортируем по убыванию similarity
+        doc_scores.sort(key=lambda x: x[1], reverse=True)
+
+        return doc_scores[:k]
+
+
+# Пример использования улучшенной системы
+if __name__ == "__main__":
+    print("=== Демонстрация улучшений для преодоления ограничений single-vector поиска ===")
+    print()
+
+    # Пример 1: Обычная система (только single-vector)
+    print("1. Инициализация стандартной системы (single-vector):")
+    try:
+        rag_standard = BookRAG(use_sections=True, use_multi_vector=False)
+        print("✓ Стандартная система инициализирована")
+    except Exception as e:
+        print(f"✗ Ошибка: {e}")
+
+    print()
+
+    # Пример 2: Улучшенная система с multi-vector подходом
+    print("2. Инициализация улучшенной системы (multi-vector + enhanced BM25):")
+    try:
+        rag_enhanced = BookRAG(use_sections=True, use_multi_vector=True)
+        print("✓ Улучшенная система инициализирована")
+        print("  - Multi-vector подход активирован")
+        print("  - Улучшенный BM25 с русской токенизацией")
+        print("  - Чанки множественных размеров")
+        print("  - Адаптивные веса для dense/sparse fusion")
+    except Exception as e:
+        print(f"✗ Ошибка: {e}")
+
+    print()
+    print("=== Ключевые улучшения согласно статье Google ===")
+    print()
+    print("🔍 ПРОБЛЕМА: Single-vector поиск имеет фундаментальные ограничения")
+    print("   При фиксированной размерности невозможно найти все релевантные документы")
+    print()
+    print("🚀 РЕШЕНИЯ РЕАЛИЗОВАНЫ:")
+    print()
+    print("1. ГИБРИДНЫЙ ПОИСК С УВЕЛИЧЕННЫМ ВЕСОМ BM25")
+    print("   ✓ BM25 (sparse) получает вес 0.5-0.6 вместо 0.3")
+    print("   ✓ Векторный поиск (dense) получает вес 0.3-0.4")
+    print("   ✓ Преодолевает ограничения single-vector подхода")
+    print()
+    print("2. MULTI-VECTOR ПОДХОД (аналог ColBERT)")
+    print("   ✓ 3 вектора на документ вместо 1")
+    print("   ✓ Базовый вектор + векторы частей + ключевые предложения")
+    print("   ✓ MaxSim aggregation для финального скора")
+    print()
+    print("3. УЛУЧШЕННАЯ ТОКЕНИЗАЦИЯ BM25")
+    print("   ✓ Настроенные параметры k1=1.5, b=0.75 для русского")
+    print("   ✓ Фильтрация стоп-слов")
+    print("   ✓ Обработка точных совпадений")
+    print()
+    print("4. МНОЖЕСТВЕННЫЕ РАЗМЕРЫ ЧАНКОВ")
+    print("   ✓ Малые (600), средние (1000), большие (1500) чанки")
+    print("   ✓ Умное перекрытие с сохранением границ предложений")
+    print("   ✓ Дедупликация для оптимизации")
+    print()
+    print("5. АДАПТИВНЫЕ ВЕСА")
+    print("   ✓ Анализ типа запроса (точный vs концептуальный)")
+    print("   ✓ Учет длины запроса")
+    print("   ✓ Динамическая корректировка весов")
+    print()
+    print("📊 ОЖИДАЕМЫЕ РЕЗУЛЬТАТЫ:")
+    print("   • Значительное улучшение recall")
+    print("   • Лучше находит релевантные документы")
+    print("   • Устойчивость к росту базы знаний")
+    print("   • Преодоление теоретических ограничений single-vector")
+    print()
+    print("🔬 ТЕОРЕТИЧЕСКОЕ ОБОСНОВАНИЕ:")
+    print("   Google доказали: sign-rank(A) > d => single-vector не работает")
+    print("   Наши решения обходят это ограничение через:")
+    print("   - Sparse поиск (BM25) - не ограничен размерностью")
+    print("   - Multi-vector - увеличивает effective размерность")
+    print("   - Адаптивное слияние - оптимально использует оба подхода")
