@@ -6,7 +6,7 @@ import os
 # Добавляем путь к модулям
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from main import BookRAG
+from main import ImprovedBookRAG
 
 # Константы безопасности
 MAX_QUESTION_LENGTH = 200
@@ -83,15 +83,15 @@ if 'rag' not in st.session_state:
     try:
         with st.spinner('Инициализация системы...'):
             logger.info("Инициализация RAG при запуске...")
-            st.session_state.rag = BookRAG(
-                use_sections=st.session_state.use_sections,
-                use_multi_vector=st.session_state.use_multi_vector
+            st.session_state.rag = ImprovedBookRAG(
+                use_sections=st.session_state.use_sections
             )
 
             # Приветственное сообщение с информацией о режиме
             mode_info = []
-            if st.session_state.use_multi_vector:
-                mode_info.append("🚀 Multi-vector поиск")
+            # Multi-vector недоступен в данной версии
+            # if st.session_state.use_multi_vector:
+            #     mode_info.append("🚀 Multi-vector поиск")
             mode_info.append("🔍 Гибридный BM25+Vector поиск")
             mode_info.append("📊 Адаптивные веса")
 
@@ -121,11 +121,12 @@ with st.sidebar:
     # Секция режимов поиска
     st.subheader("🔍 Режимы поиска")
 
-    # Переключатель multi-vector
+    # Переключатель multi-vector (недоступен в данной версии)
     new_multi_vector = st.checkbox(
-        "🚀 Multi-vector поиск",
-        value=st.session_state.use_multi_vector,
-        help="Включает создание нескольких векторов на документ для улучшения recall"
+        "🚀 Multi-vector поиск (недоступен)",
+        value=False,
+        disabled=True,
+        help="Функция недоступна в текущей версии ImprovedBookRAG"
     )
 
     # Переключатель разделов
@@ -162,7 +163,7 @@ with st.sidebar:
     # Информация о текущем режиме
     st.info(f"""
 **Текущий режим:**
-• Multi-vector: {'✅' if st.session_state.use_multi_vector else '❌'}
+• Multi-vector: ❌ (недоступен)
 • Разделы: {'✅' if st.session_state.use_sections else '❌'}
 • Гибридный поиск: ✅
 • Адаптивные веса: ✅
@@ -184,7 +185,7 @@ with st.sidebar:
     # Кнопка для пересоздания эмбеддингов
     if st.button("Пересоздать эмбеддинги"):
         with st.spinner("Пересоздание эмбеддингов..."):
-            success = st.session_state.rag.force_rebuild_embeddings()
+            success = st.session_state.rag.force_rebuild_cache()
             if success:
                 st.success("Эмбеддинги успешно пересозданы!")
             else:
@@ -212,9 +213,9 @@ with st.sidebar:
         • Dense vectors (семантическое понимание)
         • Sparse BM25 (точное совпадение ключевых слов)
 
-        🚀 **Multi-vector** - создает:
-        • 3 вектора на документ вместо 1
-        • Лучшее покрытие семантического пространства
+        🚀 **Улучшенная векторизация** - включает:
+        • Умные чанки разных размеров
+        • Оптимизированные эмбеддинги
 
         📊 **Адаптивные веса** - автоматически:
         • Анализирует тип запроса
@@ -237,19 +238,16 @@ with st.sidebar:
         • "Как работает управление командой?"
         • "Почему важна структура бизнеса?"
 
-        🔍 **Используйте multi-vector для:**
-        • Сложных многоаспектных тем
-        • Поиска скрытых связей
-        • Улучшения полноты ответов
+        🔍 **Улучшенная система поддерживает:**
+        • Сложные многоаспектные запросы
+        • Поиск релевантных связей
+        • Полные и точные ответы
         """)
 
     # Статистика производительности
-    if st.session_state.get('rag') and hasattr(st.session_state.rag, 'splits'):
-        total_chunks = len(st.session_state.rag.splits) if st.session_state.rag.splits else 0
-        st.metric("📊 Чанков в базе", total_chunks)
-        if st.session_state.use_multi_vector and st.session_state.rag.multi_vector_embeddings:
-            vectors_count = total_chunks * 3  # 3 вектора на чанк
-            st.metric("🚀 Multi-векторов", vectors_count)
+    if st.session_state.get('rag') and hasattr(st.session_state.rag, 'documents'):
+        total_chunks = len(st.session_state.rag.documents) if st.session_state.rag.documents else 0
+        st.metric("📊 Документов в базе", total_chunks)
 
 # Основной интерфейс
 st.title("📚 Книжный помощник с RAG")
@@ -258,10 +256,7 @@ st.title("📚 Книжный помощник с RAG")
 col1, col2, col3 = st.columns(3)
 
 with col1:
-    if st.session_state.use_multi_vector:
-        st.success("🚀 Multi-vector активен")
-    else:
-        st.info("🔍 Single-vector режим")
+    st.info("🔍 Векторный поиск (улучшенный)")
 
 with col2:
     st.success("📊 Адаптивные веса")
@@ -334,10 +329,9 @@ with st.sidebar:
     with st.expander("ℹ️ Как пользоваться"):
         st.markdown("""
         **Быстрый старт:**
-        1. 🚀 Включите Multi-vector для лучшего поиска
-        2. 📖 Выберите раздел книги или "Вся книга"
-        3. ❓ Задайте вопрос в поле внизу
-        4. 📋 Получите улучшенный ответ с источниками
+        1. 📖 Выберите раздел книги или "Вся книга"
+        2. ❓ Задайте вопрос в поле внизу
+        3. 📋 Получите улучшенный ответ с источниками
 
         **Примеры вопросов:**
 
@@ -349,5 +343,5 @@ with st.sidebar:
         - "Как работает управление в кризисе?"
         - "Почему важна организационная структура?"
 
-        **💡 Совет:** Multi-vector режим особенно эффективен для сложных вопросов!
+        **💡 Совет:** Система автоматически оптимизирует поиск для всех типов вопросов!
         """)
