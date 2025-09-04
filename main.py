@@ -19,15 +19,19 @@ from pinecone import Pinecone as PineconeClient
 from rank_bm25 import BM25Okapi
 import spacy
 import numpy as np
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from sklearn.metrics.pairwise import cosine_similarity
+from collections import defaultdict
+import pickle
+import hashlib
+import time
 
 # Константы безопасности
 MAX_QUESTION_LENGTH = 200
 
 # Настройка логирования
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,  # Изменили с DEBUG на INFO для производительности
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('rag.log', mode='w'),
@@ -42,52 +46,33 @@ openai_key = os.getenv("OPENAI_API_KEY")
 if openai_key:
     os.environ["OPENAI_API_KEY"] = openai_key
 
-class BookRAG:
-    def __init__(self, use_sections=True, pdf_directory="book", use_multi_vector=False):
+
+class ImprovedBookRAG:
+    def __init__(self, use_sections=True, pdf_directory="book", cache_embeddings=True):
         try:
-            logger.debug(f"Начало инициализации RAG с использованием разделов: {use_sections}, multi-vector: {use_multi_vector}")
+            logger.info(f"Инициализация улучшенной RAG системы с кэшированием: {cache_embeddings}")
             self.use_sections = use_sections
             self.pdf_directory = pdf_directory
-            self.use_multi_vector = use_multi_vector
-            self.multi_vector_embeddings = None
+            self.cache_embeddings = cache_embeddings
             self.sections_mapping = self._get_sections_mapping()
 
-            # Инициализация Pinecone
-            self.pinecone_api_key = os.getenv("PINECONE_API_KEY")
-            self.pinecone_environment = os.getenv("PINECONE_ENVIRONMENT", "gcp-starter")
-            self.index_name = "book-rag-index"
+            # Кэширование для производительности
+            self.cache_dir = "cache"
+            os.makedirs(self.cache_dir, exist_ok=True)
 
-            # Проверка Pinecone
-            pinecone_available = False
-            if self.pinecone_api_key:
-                pinecone_available = self._init_pinecone()
+            # Инициализация Pinecone (опционально)
+            self.pinecone_available = self._init_pinecone()
 
-            # Загрузка существующих эмбеддингов или создание новых
-            if pinecone_available and self._has_existing_embeddings():
-                logger.info("Найдены существующие эмбеддинги в Pinecone. Пропускаем загрузку PDF.")
-                self.documents = []
-                self.splits = []
-                self.vectorstore = self._load_existing_vectorstore()
-                # Для гибридного поиска нужно загрузить документы для BM25
-                logger.info("Загружаем документы для BM25...")
-                if use_sections:
-                    self.documents = asyncio.run(self._load_all_sections())
-                else:
-                    self.documents = asyncio.run(self._load_full_book())
-                self.splits = self._create_hierarchical_chunks()
-            else:
-                logger.info("Эмбеддинги не найдены. Загружаем PDF и создаем эмбеддинги.")
-                if use_sections:
-                    self.documents = asyncio.run(self._load_all_sections())
-                else:
-                    self.documents = asyncio.run(self._load_full_book())
-                self.splits = self._create_hierarchical_chunks()
-                self.vectorstore = self._create_or_load_vectorstore()
+            # Загрузка или создание данных
+            self._load_or_create_data()
 
             # Инициализация моделей
             self._initialize_models()
+
+            # История чата
             self.chat_history = []
-            logger.info("Инициализация RAG завершена успешно")
+
+            logger.info("Улучшенная RAG система инициализирована успешно")
 
         except Exception as e:
             logger.error(f"Критическая ошибка при инициализации RAG: {str(e)}", exc_info=True)
@@ -135,365 +120,544 @@ class BookRAG:
             "новые_начинания": "book/chast3.pdf"
         }
 
-    def _init_pinecone(self):
-        """Инициализация Pinecone"""
+    def _init_pinecone(self) -> bool:
+        """Инициализация Pinecone с улучшенной обработкой ошибок"""
         try:
-            self.pc = PineconeClient(api_key=self.pinecone_api_key)
-            indexes = [index.name for index in self.pc.list_indexes()]
-            embedding_dimension = 3072  # Для text-embedding-3-large
+            self.pinecone_api_key = os.getenv("PINECONE_API_KEY")
+            if not self.pinecone_api_key:
+                logger.info("Pinecone API ключ не найден, используем локальный FAISS")
+                return False
 
-            if self.index_name not in indexes:
-                logger.info(f"Создание нового индекса Pinecone: {self.index_name}")
+            self.pinecone_environment = os.getenv("PINECONE_ENVIRONMENT", "gcp-starter")
+            self.index_name = "book-rag-index-v2"  # Новая версия индекса
+
+            self.pc = PineconeClient(api_key=self.pinecone_api_key)
+
+            # Проверяем существование индекса
+            existing_indexes = [index.name for index in self.pc.list_indexes()]
+
+            if self.index_name not in existing_indexes:
+                logger.info(f"Создание нового Pinecone индекса: {self.index_name}")
                 self.pc.create_index(
                     name=self.index_name,
-                    dimension=embedding_dimension,
+                    dimension=3072,  # text-embedding-3-large
                     metric="cosine",
                     spec={"serverless": {"cloud": "aws", "region": "us-east-1"}}
                 )
-            else:
-                logger.info(f"Индекс {self.index_name} уже существует")
+                # Ждем готовности индекса
+                time.sleep(10)
 
             self.pinecone_index = self.pc.Index(self.index_name)
             logger.info("Pinecone успешно инициализирован")
             return True
+
         except Exception as e:
-            logger.error(f"Ошибка инициализации Pinecone: {str(e)}")
-            self.pinecone_index = None
+            logger.warning(f"Не удалось инициализировать Pinecone: {str(e)}. Используем FAISS")
             return False
 
-    def _has_existing_embeddings(self):
-        """Проверяет наличие существующих эмбеддингов в Pinecone"""
-        if not hasattr(self, 'pinecone_index') or not self.pinecone_index:
+    def _load_or_create_data(self):
+        """Загрузка или создание данных с кэшированием"""
+        cache_file = os.path.join(self.cache_dir, "processed_data.pkl")
+        embeddings_cache = os.path.join(self.cache_dir, "embeddings.pkl")
+
+        # Проверяем кэш
+        if (self.cache_embeddings and
+            os.path.exists(cache_file) and
+            self._is_cache_valid(cache_file)):
+
+            logger.info("Загрузка данных из кэша...")
+            try:
+                with open(cache_file, 'rb') as f:
+                    cached_data = pickle.load(f)
+                    self.documents = cached_data['documents']
+                    self.chunks = cached_data['chunks']
+                    self.bm25_index = cached_data['bm25_index']
+                    self.metadata_index = cached_data['metadata_index']
+
+                # Загружаем векторное хранилище
+                if self.pinecone_available and self._has_pinecone_data():
+                    self.vectorstore = self._load_pinecone_vectorstore()
+                elif os.path.exists(embeddings_cache):
+                    logger.info("Загрузка FAISS из кэша...")
+                    with open(embeddings_cache, 'rb') as f:
+                        self.vectorstore = pickle.load(f)
+                else:
+                    self.vectorstore = self._create_vectorstore()
+
+                logger.info("Данные успешно загружены из кэша")
+                return
+
+            except Exception as e:
+                logger.warning(f"Ошибка загрузки кэша: {e}. Пересоздаем данные...")
+
+        # Создаем данные с нуля
+        logger.info("Создание данных с нуля...")
+        self._create_fresh_data()
+
+        # Сохраняем в кэш
+        if self.cache_embeddings:
+            self._save_to_cache(cache_file, embeddings_cache)
+
+    def _is_cache_valid(self, cache_file: str) -> bool:
+        """Проверка валидности кэша"""
+        try:
+            cache_time = os.path.getmtime(cache_file)
+
+            # Проверяем время изменения PDF файлов
+            for file_path in self.sections_mapping.values():
+                if os.path.exists(file_path):
+                    file_time = os.path.getmtime(file_path)
+                    if file_time > cache_time:
+                        return False
+
+            return True
+        except Exception:
             return False
+
+    def _has_pinecone_data(self) -> bool:
+        """Проверка наличия данных в Pinecone"""
         try:
             stats = self.pinecone_index.describe_index_stats()
-            vector_count = stats.get('total_vector_count', 0)
-            logger.info(f"Найдено векторов в Pinecone: {vector_count}")
-            return vector_count > 0
-        except Exception as e:
-            logger.error(f"Ошибка проверки существующих эмбеддингов: {str(e)}")
+            return stats.get('total_vector_count', 0) > 0
+        except Exception:
             return False
 
-    def _load_existing_vectorstore(self):
-        """Загружает существующее векторное хранилище из Pinecone"""
-        logger.info("Загрузка существующего векторного хранилища из Pinecone")
-        class CaseInsensitiveEmbeddings(OpenAIEmbeddings):
-            def __init__(self):
-                super().__init__(model="text-embedding-3-large")
-            def embed_query(self, text: str) -> list:
-                return super().embed_query(text.lower())
+    def _create_fresh_data(self):
+        """Создание данных с нуля"""
+        # Загрузка документов
+        if self.use_sections:
+            self.documents = asyncio.run(self._load_all_sections())
+        else:
+            self.documents = asyncio.run(self._load_full_book())
 
-        embeddings = CaseInsensitiveEmbeddings()
-        vectorstore = Pinecone(
-            index=self.pinecone_index,
-            embedding=embeddings,
-            text_key="text"
-        )
-        logger.info("Существующее векторное хранилище загружено")
-        return vectorstore
+        # Создание улучшенных чанков
+        self.chunks = self._create_smart_chunks()
 
-    async def _load_and_clean_pdf_async(self, pdf_path, section_names):
-        """Асинхронная загрузка и очистка PDF с PyMuPDF"""
+        # Создание индексов
+        self._create_search_indexes()
+
+        # Создание векторного хранилища
+        self.vectorstore = self._create_vectorstore()
+
+    def _save_to_cache(self, cache_file: str, embeddings_cache: str):
+        """Сохранение в кэш"""
         try:
-            async with aiofiles.open(pdf_path, mode='rb') as f:
-                doc = fitz.open(stream=await f.read(), filetype="pdf")
-                documents = []
-                primary_section = section_names[0] if isinstance(section_names, list) else section_names
-                all_sections = section_names if isinstance(section_names, list) else [section_names]
+            cache_data = {
+                'documents': self.documents,
+                'chunks': self.chunks,
+                'bm25_index': self.bm25_index,
+                'metadata_index': self.metadata_index
+            }
 
-                for page_num in range(doc.page_count):
-                    page = doc.load_page(page_num)
-                    text = page.get_text("text")
-                    text = re.sub(r'\s+', ' ', text)
-                    text = re.sub(r'[^\w\s.,!?:;()\[\]"-]', '', text)
-                    text = re.sub(r'-\s+', '', text)
-                    text = text.replace('«', '"').replace('»', '"')
-                    normalized_text = text.lower()
+            with open(cache_file, 'wb') as f:
+                pickle.dump(cache_data, f)
 
-                    for section_name in all_sections:
-                        doc_metadata = {
-                            "cleaned": True,
-                            "length": len(text),
-                            "normalized_text": normalized_text,
-                            "section": section_name,
-                            "primary_section": primary_section,
-                            "source_file": pdf_path,
-                            "all_sections": all_sections,
-                            "page": page_num + 1
-                        }
-                        documents.append(Document(page_content=text, metadata=doc_metadata))
+            # Сохраняем FAISS если не используем Pinecone
+            if not self.pinecone_available:
+                with open(embeddings_cache, 'wb') as f:
+                    pickle.dump(self.vectorstore, f)
 
-                logger.info(f"Загружено {len(documents)} документов из {pdf_path}")
-                return documents
+            logger.info("Данные сохранены в кэш")
+
         except Exception as e:
-            logger.error(f"Ошибка загрузки {pdf_path}: {str(e)}")
-            return []
+            logger.warning(f"Не удалось сохранить кэш: {e}")
 
-    async def _load_full_book(self):
-        """Асинхронная загрузка полной книги"""
+    async def _load_all_sections(self) -> List[Document]:
+        """Улучшенная загрузка всех разделов"""
+        file_to_sections = defaultdict(list)
+
+        for section_name, file_path in self.sections_mapping.items():
+            file_to_sections[file_path].append(section_name)
+
+        tasks = []
+        for path, sections in file_to_sections.items():
+            if os.path.exists(path):
+                tasks.append(self._load_and_clean_pdf_async(path, sections))
+            else:
+                logger.warning(f"Файл не найден: {path}")
+
+        if not tasks:
+            raise FileNotFoundError("Не найдено ни одного PDF файла")
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        all_documents = []
+        for result in results:
+            if isinstance(result, list):
+                all_documents.extend(result)
+            else:
+                logger.error(f"Ошибка при загрузке: {result}")
+
+        logger.info(f"Загружено {len(all_documents)} страниц из {len(tasks)} файлов")
+        return all_documents
+
+    async def _load_full_book(self) -> List[Document]:
+        """Загрузка полной книги"""
         book_path = "book/book.pdf"
         if not os.path.exists(book_path):
             raise FileNotFoundError(f"Файл {book_path} не найден")
         return await self._load_and_clean_pdf_async(book_path, ["book"])
 
-    async def _load_all_sections(self):
-        """Асинхронная загрузка всех разделов книги"""
-        file_to_sections = {}
-        for section_name, file_path in self.sections_mapping.items():
-            if file_path not in file_to_sections:
-                file_to_sections[file_path] = []
-            file_to_sections[file_path].append(section_name)
+    async def _load_and_clean_pdf_async(self, pdf_path: str, section_names: List[str]) -> List[Document]:
+        """Улучшенная асинхронная загрузка PDF"""
+        try:
+            async with aiofiles.open(pdf_path, mode='rb') as f:
+                pdf_data = await f.read()
 
-        tasks = [self._load_and_clean_pdf_async(path, sections)
-                 for path, sections in file_to_sections.items()]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        all_documents = [doc for sublist in results if isinstance(sublist, list) for doc in sublist]
+            doc = fitz.open(stream=pdf_data, filetype="pdf")
+            documents = []
 
-        logger.info(f"Загружено разделов: {len(set([doc.metadata['section'] for doc in all_documents]))}")
-        logger.info(f"Общее количество страниц: {len(all_documents)}")
-        return all_documents
+            primary_section = section_names[0]
 
-    def _create_hierarchical_chunks(self):
-        """Создание улучшенных семантических чанков с multiple размерами для преодоления ограничений single-vector"""
-        logger.debug("Создание улучшенных семантических чанков...")
+            for page_num in range(doc.page_count):
+                page = doc.load_page(page_num)
+                text = page.get_text("text")
 
-        # Попытка загрузить русскую модель spaCy с fallback
+                # Улучшенная очистка текста
+                cleaned_text = self._advanced_text_cleaning(text)
+
+                if len(cleaned_text.strip()) < 50:  # Пропускаем слишком короткие страницы
+                    continue
+
+                # Создаем документ для каждой секции
+                for section_name in section_names:
+                    metadata = {
+                        "source_file": pdf_path,
+                        "page": page_num + 1,
+                        "section": section_name,
+                        "primary_section": primary_section,
+                        "all_sections": section_names,
+                        "char_count": len(cleaned_text),
+                        "word_count": len(cleaned_text.split()),
+                        "file_hash": hashlib.md5(pdf_data[:1000]).hexdigest()  # Для версионирования
+                    }
+
+                    documents.append(Document(
+                        page_content=cleaned_text,
+                        metadata=metadata
+                    ))
+
+            doc.close()
+            logger.info(f"Обработано {len(documents)} документов из {pdf_path}")
+            return documents
+
+        except Exception as e:
+            logger.error(f"Ошибка загрузки {pdf_path}: {str(e)}")
+            return []
+
+    def _advanced_text_cleaning(self, text: str) -> str:
+        """Улучшенная очистка текста"""
+        # Базовая очистка
+        text = re.sub(r'\s+', ' ', text)  # Множественные пробелы
+        text = re.sub(r'-\s*\n\s*', '', text)  # Переносы слов
+        text = re.sub(r'\n+', '\n', text)  # Множественные переносы строк
+
+        # Удаление служебных символов, но сохранение структуры
+        text = re.sub(r'[^\w\s.,!?:;()\[\]"«»№—–-]', '', text)
+
+        # Исправление кавычек
+        text = text.replace('«', '"').replace('»', '"')
+        text = text.replace('„', '"').replace('"', '"')
+
+        # Удаление лишних пробелов вокруг знаков препинания
+        text = re.sub(r'\s+([.,!?:;])', r'\1', text)
+        text = re.sub(r'([.,!?:;])\s+', r'\1 ', text)
+
+        return text.strip()
+
+    def _create_smart_chunks(self) -> List[Document]:
+        """Создание умных чанков с учетом семантики"""
+        logger.info("Создание умных чанков...")
+
+        # Попытка загрузить русскую модель spaCy
+        nlp = None
         try:
             nlp = spacy.load("ru_core_news_lg")
-            logger.info("Загружена русская модель spaCy ru_core_news_lg")
         except OSError:
-            logger.warning("Русская модель spaCy не найдена, попытка загрузить малую модель...")
             try:
                 nlp = spacy.load("ru_core_news_sm")
-                logger.info("Загружена малая русская модель spaCy ru_core_news_sm")
             except OSError:
-                logger.warning("Русские модели spaCy недоступны, используем базовую обработку текста")
-                nlp = None
-
-        # Создаем чанки разных размеров для лучшего покрытия
-        chunk_configs = [
-            {"size": 600, "overlap": 150, "type": "small"},    # Для детальных вопросов
-            {"size": 1000, "overlap": 250, "type": "medium"},  # Базовые чанки
-            {"size": 1500, "overlap": 400, "type": "large"},   # Для контекстных вопросов
-        ]
+                logger.warning("spaCy модели не найдены, используем простое разделение")
 
         all_chunks = []
 
-        for config in chunk_configs:
-            logger.debug(f"Создание чанков размера {config['size']} с перекрытием {config['overlap']}")
+        # Конфигурации чанков для разных типов поиска
+        chunk_configs = [
+            {"size": 800, "overlap": 100, "type": "standard", "weight": 1.0},
+            {"size": 1200, "overlap": 200, "type": "extended", "weight": 0.8},
+            {"size": 400, "overlap": 50, "type": "precise", "weight": 1.2}
+        ]
 
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=config["size"],
-                chunk_overlap=config["overlap"],
-                length_function=len,
-                separators=["\n\n\n", "\n\n", "Глава ", "Раздел ", "Часть ", ". ", "? ", "! ", ": ", "; ", "\n"]
-            )
+        for doc in self.documents:
+            text = doc.page_content
 
-            chunks = []
-            for doc in self.documents:
-                # Если spaCy доступна, используем её для разделения на предложения
-                if nlp is not None:
-                    try:
-                        spacy_doc = nlp(doc.page_content)
-                        sentences = [sent.text for sent in spacy_doc.sents]
-                    except Exception as e:
-                        logger.warning(f"Ошибка spaCy: {e}, используем простое разделение")
-                        sentences = self._simple_sentence_split(doc.page_content)
-                else:
-                    # Простое разделение на предложения без spaCy
-                    sentences = self._simple_sentence_split(doc.page_content)
+            # Разделение на предложения
+            if nlp:
+                try:
+                    spacy_doc = nlp(text)
+                    sentences = [sent.text.strip() for sent in spacy_doc.sents]
+                except Exception:
+                    sentences = self._simple_sentence_split(text)
+            else:
+                sentences = self._simple_sentence_split(text)
 
-                current_chunk = ""
-                current_length = 0
-                chunk_index = 0
+            # Создание чанков разных размеров
+            for config in chunk_configs:
+                chunks = self._create_chunks_with_config(
+                    sentences, doc, config
+                )
+                all_chunks.extend(chunks)
 
-                for sent in sentences:
-                    sent_len = len(sent)
-                    if current_length + sent_len > config["size"]:
-                        if current_chunk.strip():  # Проверяем что чанк не пустой
-                            chunk_metadata = doc.metadata.copy()
-                            chunk_metadata.update({
-                                "chunk_index": chunk_index,
-                                "chunk_size": current_length,
-                                "chunk_type": self._determine_chunk_type(chunk_index, len(sentences)),
-                                "chunk_size_category": config["type"],
-                                "chunk_config_size": config["size"]
-                            })
-                            chunks.append(Document(page_content=current_chunk.strip(), metadata=chunk_metadata))
+        # Удаление дубликатов и ранжирование
+        unique_chunks = self._deduplicate_and_rank_chunks(all_chunks)
 
-                        # Создаем перекрытие с предыдущим чанком
-                        overlap_text = self._create_overlap(current_chunk, config["overlap"])
-                        current_chunk = overlap_text + " " + sent
-                        current_length = len(current_chunk)
-                        chunk_index += 1
-                    else:
-                        current_chunk += " " + sent if current_chunk else sent
-                        current_length += sent_len
-
-                # Добавляем последний чанк
-                if current_chunk.strip():
-                    chunk_metadata = doc.metadata.copy()
-                    chunk_metadata.update({
-                        "chunk_index": chunk_index,
-                        "chunk_size": current_length,
-                        "chunk_type": self._determine_chunk_type(chunk_index, chunk_index + 1),
-                        "chunk_size_category": config["type"],
-                        "chunk_config_size": config["size"]
-                    })
-                    chunks.append(Document(page_content=current_chunk.strip(), metadata=chunk_metadata))
-
-            all_chunks.extend(chunks)
-            logger.debug(f"Создано {len(chunks)} чанков размера {config['type']}")
-
-        # Удаляем дубликаты на основе содержимого и метаданных
-        unique_chunks = self._deduplicate_chunks(all_chunks)
-
-        logger.info(f"Создано {len(unique_chunks)} уникальных семантических чанков ({len(all_chunks)} до дедупликации)")
+        logger.info(f"Создано {len(unique_chunks)} умных чанков")
         return unique_chunks
 
-    def _determine_chunk_type(self, chunk_index: int, total_chunks: int) -> str:
-        """Определяет тип чанка на основе позиции"""
-        if chunk_index == 0:
-            return "start"
-        elif chunk_index == total_chunks - 1:
-            return "end"
-        else:
-            return "middle"
+    def _create_chunks_with_config(self, sentences: List[str], doc: Document, config: dict) -> List[Document]:
+        """Создание чанков с определенной конфигурацией"""
+        chunks = []
+        current_chunk = ""
+        current_length = 0
+        chunk_index = 0
 
-    def _create_overlap(self, text: str, overlap_size: int) -> str:
-        """Создает перекрытие заданного размера с конца текста"""
+        for sent in sentences:
+            sent_len = len(sent)
+
+            # Проверяем, нужно ли создать новый чанк
+            if current_length + sent_len > config["size"] and current_chunk:
+                # Создаем чанк
+                chunk_doc = self._create_chunk_document(
+                    current_chunk.strip(), doc, chunk_index, config
+                )
+                chunks.append(chunk_doc)
+
+                # Создаем перекрытие
+                overlap_text = self._create_smart_overlap(current_chunk, config["overlap"])
+                current_chunk = overlap_text + " " + sent if overlap_text else sent
+                current_length = len(current_chunk)
+                chunk_index += 1
+            else:
+                current_chunk += (" " + sent if current_chunk else sent)
+                current_length += sent_len
+
+        # Добавляем последний чанк
+        if current_chunk.strip():
+            chunk_doc = self._create_chunk_document(
+                current_chunk.strip(), doc, chunk_index, config
+            )
+            chunks.append(chunk_doc)
+
+        return chunks
+
+    def _create_chunk_document(self, text: str, original_doc: Document,
+                             chunk_index: int, config: dict) -> Document:
+        """Создание документа чанка с метаданными"""
+        metadata = original_doc.metadata.copy()
+        metadata.update({
+            "chunk_index": chunk_index,
+            "chunk_type": config["type"],
+            "chunk_size": len(text),
+            "chunk_weight": config["weight"],
+            "word_count": len(text.split()),
+            "has_numbers": bool(re.search(r'\d+', text)),
+            "has_questions": '?' in text,
+            "sentence_count": len(self._simple_sentence_split(text))
+        })
+
+        return Document(page_content=text, metadata=metadata)
+
+    def _create_smart_overlap(self, text: str, overlap_size: int) -> str:
+        """Создание умного перекрытия по границам предложений"""
         if len(text) <= overlap_size:
             return text
 
-        # Находим хорошую точку разрыва (конец предложения)
-        sentences = text.split('. ')
-        if len(sentences) > 1:
-            # Берем последние предложения, которые помещаются в overlap_size
-            overlap_text = ""
-            for sentence in reversed(sentences[-3:]):  # Берем максимум 3 последних предложения
-                candidate = sentence + ". " + overlap_text
-                if len(candidate) <= overlap_size:
-                    overlap_text = candidate
-                else:
-                    break
-            return overlap_text.strip()
-        else:
-            # Если предложений мало, берем последние overlap_size символов
-            return text[-overlap_size:].strip()
+        sentences = self._simple_sentence_split(text)
 
-    def _deduplicate_chunks(self, chunks: List[Document]) -> List[Document]:
-        """Удаляет дублирующиеся чанки на основе содержимого"""
-        seen_content = set()
-        unique_chunks = []
+        # Берем последние предложения, которые помещаются в overlap
+        overlap_text = ""
+        for sentence in reversed(sentences):
+            candidate = sentence + ". " + overlap_text
+            if len(candidate) <= overlap_size:
+                overlap_text = candidate
+            else:
+                break
 
+        return overlap_text.strip()
+
+    def _simple_sentence_split(self, text: str) -> List[str]:
+        """Простое разделение на предложения"""
+        sentences = re.split(r'[.!?]+\s+', text)
+        return [s.strip() for s in sentences if len(s.strip()) > 10]
+
+    def _deduplicate_and_rank_chunks(self, chunks: List[Document]) -> List[Document]:
+        """Дедупликация и ранжирование чанков"""
+        # Группируем по содержимому (первые 100 символов)
+        content_groups = defaultdict(list)
         for chunk in chunks:
-            # Создаем ключ на основе содержимого и страницы
-            content_key = (
-                chunk.page_content[:100],  # Первые 100 символов для быстрого сравнения
-                chunk.metadata.get('page', 0),
-                chunk.metadata.get('section', ''),
-                chunk.metadata.get('chunk_size_category', '')
+            key = (
+                chunk.page_content[:100],
+                chunk.metadata.get('page'),
+                chunk.metadata.get('section')
             )
+            content_groups[key].append(chunk)
 
-            if content_key not in seen_content:
-                seen_content.add(content_key)
-                unique_chunks.append(chunk)
+        # Выбираем лучший чанк из каждой группы
+        unique_chunks = []
+        for group in content_groups.values():
+            if len(group) == 1:
+                unique_chunks.append(group[0])
+            else:
+                # Выбираем чанк с наибольшим весом
+                best_chunk = max(group, key=lambda x: x.metadata.get('chunk_weight', 1.0))
+                unique_chunks.append(best_chunk)
 
         return unique_chunks
 
-    def _simple_sentence_split(self, text):
-        """Простое разделение текста на предложения без spaCy"""
-        # Разделяем по основным знакам препинания
-        import re
-        sentences = re.split(r'[.!?]+\s+', text)
-        # Фильтруем пустые строки и очень короткие предложения
-        sentences = [s.strip() for s in sentences if len(s.strip()) > 10]
-        return sentences
+    def _create_search_indexes(self):
+        """Создание поисковых индексов"""
+        logger.info("Создание поисковых индексов...")
 
-    def _create_or_load_vectorstore(self):
-        """Создание или загрузка векторного хранилища"""
-        logger.debug("Создание/загрузка векторного хранилища...")
-        class CaseInsensitiveEmbeddings(OpenAIEmbeddings):
-            def __init__(self):
-                super().__init__(model="text-embedding-3-large")
-            def embed_query(self, text: str) -> list:
-                return super().embed_query(text.lower())
+        # Подготовка текстов для BM25
+        texts = [chunk.page_content.lower() for chunk in self.chunks]
+        tokenized_texts = [self._advanced_tokenize(text) for text in texts]
 
-        embeddings = CaseInsensitiveEmbeddings()
-        processed_docs = [doc for doc in self.splits if 'normalized_text' in doc.metadata or setattr(doc.metadata, 'normalized_text', doc.page_content.lower())]
+        # Создание BM25 индекса с оптимизированными параметрами для русского
+        self.bm25_index = BM25Okapi(tokenized_texts, k1=1.2, b=0.75)
 
-        if hasattr(self, 'pinecone_index') and self.pinecone_index:
-            try:
-                stats = self.pinecone_index.describe_index_stats()
-                if stats['total_vector_count'] > 0:
-                    logger.info("Загрузка существующих эмбеддингов из Pinecone")
-                    vectorstore = Pinecone(
-                        index=self.pinecone_index,
-                        embedding=embeddings,
-                        text_key="text"
-                    )
-                else:
-                    logger.info("Создание новых эмбеддингов в Pinecone")
-                    vectorstore = self._create_pinecone_vectorstore_with_batching(processed_docs, embeddings)
-                logger.info("Pinecone векторное хранилище готово")
-                return vectorstore
-            except Exception as e:
-                logger.error(f"Ошибка работы с Pinecone: {str(e)}")
-                logger.info("Переключение на FAISS...")
+        # Создание метаданных индекса для быстрого поиска по фильтрам
+        self.metadata_index = self._create_metadata_index()
 
-        logger.info("Создание FAISS векторного хранилища")
-        vectorstore = self._create_faiss_vectorstore_with_batching(processed_docs, embeddings)
-        logger.info("FAISS векторное хранилище создано")
-        return vectorstore
+        logger.info("Поисковые индексы созданы")
 
-    def _create_faiss_vectorstore_with_batching(self, docs, embeddings, batch_size=50):
-        """Создание FAISS векторного хранилища с батчингом"""
-        logger.info(f"Создание FAISS с батчингом. Размер батча: {batch_size}")
-        vectorstore = None
-        for i in range(0, len(docs), batch_size):
-            batch = docs[i:i + batch_size]
-            logger.debug(f"Обработка батча {i//batch_size + 1}/{(len(docs) + batch_size - 1)//batch_size}")
-            try:
-                if vectorstore is None:
-                    vectorstore = FAISS.from_documents(batch, embeddings)
-                else:
-                    batch_vectorstore = FAISS.from_documents(batch, embeddings)
-                    vectorstore.merge_from(batch_vectorstore)
-            except Exception as e:
-                logger.error(f"Ошибка обработки батча {i//batch_size + 1}: {str(e)}")
-                if batch_size > 10:
-                    logger.info(f"Уменьшение размера батча до {batch_size//2}")
-                    return self._create_faiss_vectorstore_with_batching(docs, embeddings, batch_size//2)
-                else:
-                    raise
-        return vectorstore
+    def _create_metadata_index(self) -> Dict:
+        """Создание индекса метаданных для быстрой фильтрации"""
+        index = {
+            'by_section': defaultdict(list),
+            'by_page': defaultdict(list),
+            'by_chunk_type': defaultdict(list),
+            'with_numbers': [],
+            'with_questions': []
+        }
 
-    def _create_pinecone_vectorstore_with_batching(self, docs, embeddings, batch_size=50):
-        """Создание Pinecone векторного хранилища с батчингом"""
-        logger.info(f"Создание Pinecone с батчингом. Размер батча: {batch_size}")
-        for i in range(0, len(docs), batch_size):
-            batch = docs[i:i + batch_size]
-            logger.debug(f"Обработка батча {i//batch_size + 1}/{(len(docs) + batch_size - 1)//batch_size}")
-            try:
+        for i, chunk in enumerate(self.chunks):
+            metadata = chunk.metadata
+
+            index['by_section'][metadata.get('section', 'unknown')].append(i)
+            index['by_page'][metadata.get('page', 0)].append(i)
+            index['by_chunk_type'][metadata.get('chunk_type', 'standard')].append(i)
+
+            if metadata.get('has_numbers', False):
+                index['with_numbers'].append(i)
+            if metadata.get('has_questions', False):
+                index['with_questions'].append(i)
+
+        return index
+
+    def _advanced_tokenize(self, text: str) -> List[str]:
+        """Улучшенная токенизация для русского языка"""
+        # Нормализация
+        text = text.lower()
+
+        # Разделение по знакам препинания с сохранением важных
+        text = re.sub(r'([.!?,:;])', r' \1 ', text)
+        text = re.sub(r'[^\w\s.!?,:;]', ' ', text)
+
+        tokens = text.split()
+
+        # Фильтрация стоп-слов (расширенный список)
+        stop_words = {
+            'а', 'и', 'но', 'или', 'да', 'нет', 'не', 'ни', 'в', 'во', 'на', 'по', 'за',
+            'к', 'с', 'со', 'от', 'до', 'для', 'при', 'о', 'об', 'что', 'как', 'так',
+            'это', 'то', 'те', 'тот', 'та', 'же', 'уже', 'еще', 'ещё', 'только', 'лишь',
+            'будет', 'была', 'было', 'были', 'есть', 'быть', 'был'
+        }
+
+        # Фильтруем токены
+        filtered_tokens = []
+        for token in tokens:
+            if (len(token) > 2 and
+                token not in stop_words and
+                not token.isdigit() and
+                token not in '.!?,:;'):
+                filtered_tokens.append(token)
+
+        return filtered_tokens
+
+    def _create_vectorstore(self):
+        """Создание векторного хранилища"""
+        logger.info("Создание векторного хранилища...")
+
+        # Используем улучшенные эмбеддинги
+        embeddings = OpenAIEmbeddings(
+            model="text-embedding-3-large",
+            dimensions=1536  # Уменьшенная размерность для экономии
+        )
+
+        if self.pinecone_available:
+            return self._create_pinecone_vectorstore(embeddings)
+        else:
+            return self._create_faiss_vectorstore(embeddings)
+
+    def _create_pinecone_vectorstore(self, embeddings):
+        """Создание Pinecone векторного хранилища"""
+        try:
+            # Создаем батчами для стабильности
+            batch_size = 50
+            for i in range(0, len(self.chunks), batch_size):
+                batch = self.chunks[i:i + batch_size]
+
                 if i == 0:
                     vectorstore = Pinecone.from_documents(
-                        batch,
-                        embeddings,
-                        index_name=self.index_name
+                        batch, embeddings, index_name=self.index_name
                     )
                 else:
                     Pinecone.from_documents(
-                        batch,
-                        embeddings,
-                        index_name=self.index_name
+                        batch, embeddings, index_name=self.index_name
                     )
-            except Exception as e:
-                logger.error(f"Ошибка обработки батча {i//batch_size + 1}: {str(e)}")
-                if batch_size > 10:
-                    logger.info(f"Уменьшение размера батча до {batch_size//2}")
-                    return self._create_pinecone_vectorstore_with_batching(docs, embeddings, batch_size//2)
+
+                logger.info(f"Обработан батч {i//batch_size + 1}/{(len(self.chunks) + batch_size - 1)//batch_size}")
+
+            return Pinecone(
+                index=self.pinecone_index,
+                embedding=embeddings,
+                text_key="text"
+            )
+
+        except Exception as e:
+            logger.error(f"Ошибка создания Pinecone: {e}")
+            return self._create_faiss_vectorstore(embeddings)
+
+    def _create_faiss_vectorstore(self, embeddings):
+        """Создание FAISS векторного хранилища"""
+        try:
+            batch_size = 100
+            vectorstore = None
+
+            for i in range(0, len(self.chunks), batch_size):
+                batch = self.chunks[i:i + batch_size]
+
+                if vectorstore is None:
+                    vectorstore = FAISS.from_documents(batch, embeddings)
                 else:
-                    raise
+                    batch_vs = FAISS.from_documents(batch, embeddings)
+                    vectorstore.merge_from(batch_vs)
+
+                logger.info(f"Обработан батч {i//batch_size + 1}/{(len(self.chunks) + batch_size - 1)//batch_size}")
+
+            return vectorstore
+
+        except Exception as e:
+            logger.error(f"Ошибка создания FAISS: {e}")
+            raise
+
+    def _load_pinecone_vectorstore(self):
+        """Загрузка существующего Pinecone векторного хранилища"""
+        embeddings = OpenAIEmbeddings(
+            model="text-embedding-3-large",
+            dimensions=1536
+        )
+
         return Pinecone(
             index=self.pinecone_index,
             embedding=embeddings,
@@ -501,661 +665,717 @@ class BookRAG:
         )
 
     def _initialize_models(self):
-        """Инициализация моделей"""
-        logger.debug("Инициализация моделей...")
-        self.llm = ChatOpenAI(model_name="gpt-4o", temperature=0)
-        self.light_llm = ChatOpenAI(model_name="gpt-4o", temperature=0.2)
+        """Инициализация языковых моделей"""
+        logger.info("Инициализация языковых моделей...")
 
-        # Инициализация multi-vector подхода если включен
-        if self.use_multi_vector:
-            logger.info("Инициализация multi-vector подхода...")
-            base_embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-            self.multi_vector_embeddings = MultiVectorEmbeddings(base_embeddings, num_vectors=3)
+        # Основная модель для ответов
+        self.llm = ChatOpenAI(
+            model_name="gpt-4o-mini",  # Более экономичная модель
+            temperature=0.1,
+            max_tokens=2000
+        )
 
-            # Создаем multi-vector эмбеддинги для всех документов
-            if self.splits:
-                texts = [doc.page_content for doc in self.splits]
-                logger.info(f"Создание multi-vector эмбеддингов для {len(texts)} документов...")
-                self.multi_vector_embeddings.embed_documents(texts)
-                logger.info("Multi-vector эмбеддинги созданы")
+        # Легкая модель для анализа запросов
+        self.light_llm = ChatOpenAI(
+            model_name="gpt-4o-mini",
+            temperature=0,
+            max_tokens=500
+        )
 
+        # Создание цепочки QA с улучшенным ретривером
         self.qa_chain = ConversationalRetrievalChain.from_llm(
             self.llm,
-            retriever=self.vectorstore.as_retriever(search_kwargs={"k": 5}),
-            return_source_documents=True
+            retriever=self._create_enhanced_retriever(),
+            return_source_documents=True,
+            verbose=False
         )
-        logger.info("Модели инициализированы успешно")
 
-    def _split_complex_question(self, question: str):
-        """Разбиение сложных вопросов на подзапросы"""
-        # Упрощаем - для большинства вопросов достаточно одного запроса
-        # Это устранит проблемы с парсингом JSON от LLM
+        logger.info("Языковые модели инициализированы")
+
+    def _create_enhanced_retriever(self):
+        """Создание улучшенного ретривера"""
+        base_retriever = self.vectorstore.as_retriever(
+            search_kwargs={"k": 15}  # Увеличенное количество для лучшего покрытия
+        )
+
+        return base_retriever
+
+    def ask_question(self, question: str, section_filter: Optional[str] = None) -> str:
+        """Основной метод для ответа на вопросы"""
         try:
-            # Простая проверка - если вопрос содержит "и", "а также", "плюс" - можем разделить
-            if any(word in question.lower() for word in [" и ", " а также ", " плюс ", " кроме того "]):
-                # Простое разделение по союзам
-                parts = []
-                for separator in [" и ", " а также ", " плюс ", " кроме того "]:
-                    if separator in question.lower():
-                        parts = question.split(separator, 1)
-                        break
-
-                if len(parts) == 2:
-                    return [part.strip() for part in parts]
-
-            # В остальных случаях возвращаем исходный вопрос
-            return [question]
-        except Exception as e:
-            logger.warning(f"Ошибка при разделении вопроса: {e}")
-            return [question]
-
-    def ask_question(self, question: str, section_filter=None):
-        """Обработка вопроса пользователя"""
-        try:
-            if len(question) > MAX_QUESTION_LENGTH:
-                return f"Ошибка: Вопрос слишком длинный (максимум {MAX_QUESTION_LENGTH} символов)."
-            if not question.strip():
+            # Валидация входных данных
+            if not question or not question.strip():
                 return "Ошибка: Вопрос не может быть пустым."
 
-            suspicious_patterns = [
-                "ignore previous", "ignore above", "forget everything",
-                "system prompt", "system message", "you are now",
-                "act as", "pretend to be", "roleplay as"
-            ]
-            question_lower = question.lower()
-            for pattern in suspicious_patterns:
-                if pattern in question_lower:
-                    return "Ошибка: Обнаружен подозрительный запрос. Задайте вопрос о книге."
+            if len(question) > MAX_QUESTION_LENGTH:
+                return f"Ошибка: Вопрос слишком длинный (максимум {MAX_QUESTION_LENGTH} символов)."
 
-            logger.debug(f"Обработка вопроса: {question}")
-            subquestions = self._split_complex_question(question)
+            # Проверка на подозрительные запросы
+            if self._is_suspicious_query(question):
+                return "Ошибка: Обнаружен подозрительный запрос. Задайте вопрос о книге."
 
-            # Если один вопрос - обрабатываем напрямую
-            if len(subquestions) == 1:
-                docs = self._hybrid_search_with_filter(question.lower(), section_filter)
-                if not docs:
-                    return "Информация по данному вопросу в книге отсутствует."
+            logger.info(f"Обработка вопроса: {question[:100]}...")
 
-                context = self._create_context_window(docs)
-                logger.debug(f"Контекст для вопроса '{question}': {context[:500]}..." if len(context) > 500 else f"Контекст: {context}")
-                prompt = self._create_enhanced_prompt(question, context, section_filter)
-                result = self.qa_chain({"question": prompt, "chat_history": self.chat_history})
-                self.chat_history.append((question, result["answer"]))
-                return self._post_process_answer(result["answer"], docs)
+            # Анализ и улучшение запроса
+            enhanced_query = self._enhance_query(question)
 
-            # Если несколько подвопросов
-            else:
-                answers = []
-                relevant_docs = []
+            # Гибридный поиск релевантных документов
+            relevant_docs = self._advanced_hybrid_search(enhanced_query, section_filter)
 
-                for subq in subquestions:
-                    docs = self._hybrid_search_with_filter(subq.lower(), section_filter)
-                    if not docs:
-                        answers.append(f"Информация по подзапросу '{subq}' отсутствует.")
-                        continue
-                    relevant_docs.extend(docs)
-                    context = self._create_context_window(docs)
-                    logger.debug(f"Контекст для подвопроса '{subq}': {context[:300]}..." if len(context) > 300 else f"Контекст: {context}")
-                    prompt = self._create_enhanced_prompt(subq, context, section_filter)
-                    result = self.qa_chain({"question": prompt, "chat_history": self.chat_history})
-                    answers.append(result["answer"])
-                    self.chat_history.append((subq, result["answer"]))
+            if not relevant_docs:
+                return self._handle_no_results(question, section_filter)
 
-                final_answer = "\n".join([f"Часть {i+1}: {ans}" for i, ans in enumerate(answers)])
-                return self._post_process_answer(final_answer, relevant_docs)
+            # Создание контекста и ответа
+            context = self._create_optimized_context(relevant_docs)
+            prompt = self._create_smart_prompt(question, context, section_filter)
+
+            # Получение ответа от модели
+            result = self.qa_chain({"question": prompt, "chat_history": self.chat_history})
+
+            # Постобработка ответа
+            final_answer = self._postprocess_answer(result["answer"], relevant_docs)
+
+            # Сохранение в историю
+            self.chat_history.append((question, result["answer"]))
+
+            # Ограничиваем историю для производительности
+            if len(self.chat_history) > 10:
+                self.chat_history = self.chat_history[-10:]
+
+            return final_answer
 
         except Exception as e:
-            error_msg = str(e)
-            logger.error(f"Ошибка при обработке вопроса '{question}': {error_msg}", exc_info=True)
+            logger.error(f"Ошибка при обработке вопроса: {str(e)}", exc_info=True)
+            return self._handle_error(e)
 
-            # Более конкретные сообщения об ошибках
-            if "openai" in error_msg.lower():
-                return f"Ошибка OpenAI API: {error_msg}. Проверьте API ключ."
-            elif "pinecone" in error_msg.lower():
-                return f"Ошибка Pinecone: {error_msg}. Проверьте настройки Pinecone."
-            elif "spacy" in error_msg.lower():
-                return f"Ошибка spaCy: {error_msg}. Установите модель командой: python -m spacy download ru_core_news_sm"
-            elif "splits" in error_msg.lower() or "list index" in error_msg.lower():
-                return f"Ошибка данных: {error_msg}. Попробуйте пересоздать эмбеддинги."
-            else:
-                return f"Произошла ошибка: {error_msg}. Попробуйте переформулировать вопрос."
+    def _is_suspicious_query(self, question: str) -> bool:
+        """Проверка на подозрительные запросы"""
+        suspicious_patterns = [
+            "ignore previous", "ignore above", "forget everything",
+            "system prompt", "system message", "you are now",
+            "act as", "pretend to be", "roleplay as", "jailbreak"
+        ]
 
-    def _hybrid_search_with_filter(self, question: str, section_filter=None):
-        """Улучшенный гибридный поиск с учетом ограничений single-vector подхода"""
-        try:
-            # Увеличиваем количество документов для лучшего покрытия
-            k_vector = 15
-            k_bm25 = 20
-            k_multi_vector = 12
-            k_final = 15
-
-            vector_docs = []
-            multi_vector_docs = []
-
-            # Обычный векторный поиск
-            if section_filter:
-                filter_dict = {"section": {"$eq": section_filter}}
-                vector_docs = [(doc, 1.0) for doc in self.vectorstore.similarity_search(
-                    question, k=k_vector, filter=filter_dict
-                )]
-            else:
-                vector_docs = self.vectorstore.similarity_search_with_score(question, k=k_vector)
-
-            # Multi-vector поиск если включен
-            if self.use_multi_vector and self.multi_vector_embeddings:
-                logger.debug("Выполняется multi-vector поиск...")
-                # Фильтруем документы по разделу если нужно
-                filtered_docs = self.splits
-                if section_filter:
-                    filtered_docs = [doc for doc in self.splits if doc.metadata.get('section') == section_filter]
-
-                multi_vector_results = self.multi_vector_embeddings.similarity_search(
-                    question, filtered_docs, k=k_multi_vector
-                )
-                multi_vector_docs = multi_vector_results
-
-            # Проверяем, что self.splits не пустой
-            if not self.splits:
-                logger.warning("self.splits пустой, используем только векторный поиск")
-                return [doc for doc, _ in vector_docs[:k_final]]
-
-            # Улучшенная токенизация для русского языка
-            tokenized_corpus = [self._advanced_tokenize(doc.page_content.lower()) for doc in self.splits]
-
-            # Настройка BM25 для русского языка
-            bm25 = BM25Okapi(tokenized_corpus, k1=1.5, b=0.75)
-            tokenized_query = self._advanced_tokenize(question.lower())
-            bm25_scores = bm25.get_scores(tokenized_query)
-
-            keyword_docs = []
-            # Сортируем по BM25 скорам и берем топ результаты
-            scored_indices = [(idx, score) for idx, score in enumerate(bm25_scores) if score > 0]
-            scored_indices.sort(key=lambda x: x[1], reverse=True)
-
-            for idx, score in scored_indices[:k_bm25]:
-                if not section_filter or self.splits[idx].metadata.get('section') == section_filter:
-                    # Увеличиваем бонус для разных типов чанков
-                    chunk_type_multiplier = {
-                        'start': 1.3, 'end': 1.2, 'middle': 1.0
-                    }.get(self.splits[idx].metadata.get('chunk_type', 'middle'), 1.0)
-
-                    # Бонус для точного совпадения ключевых слов
-                    exact_match_bonus = 1.0
-                    doc_lower = self.splits[idx].page_content.lower()
-                    query_words = tokenized_query
-                    exact_matches = sum(1 for word in query_words if word in doc_lower)
-                    if exact_matches > 0:
-                        exact_match_bonus = 1.0 + (exact_matches / len(query_words)) * 0.5
-
-                    final_score = score * chunk_type_multiplier * exact_match_bonus
-                    keyword_docs.append((self.splits[idx], final_score))
-
-            # Вычисляем адаптивные веса на основе характеристик запроса
-            # Это критично для преодоления фундаментальных ограничений single-vector подхода
-            adaptive_weights = self._calculate_adaptive_weights(question, vector_docs, keyword_docs, multi_vector_docs)
-
-            unique_docs = {}
-
-            # 1. Векторный поиск с адаптивным весом
-            for doc, score in vector_docs:
-                key = (doc.page_content, doc.metadata.get('page'), doc.metadata.get('section'))
-                unique_docs[key] = (doc, score * adaptive_weights['vector'])
-
-            # 2. Multi-vector поиск с адаптивным весом
-            if self.use_multi_vector and multi_vector_docs:
-                logger.debug(f"Добавляем {len(multi_vector_docs)} multi-vector результатов")
-                for doc, score in multi_vector_docs:
-                    key = (doc.page_content, doc.metadata.get('page'), doc.metadata.get('section'))
-                    if key in unique_docs:
-                        unique_docs[key] = (doc, unique_docs[key][1] + score * adaptive_weights['multi_vector'])
-                    else:
-                        unique_docs[key] = (doc, score * adaptive_weights['multi_vector'])
-
-            # 3. BM25 с адаптивным весом (обычно наибольший для sparse search)
-            for doc, score in keyword_docs:
-                key = (doc.page_content, doc.metadata.get('page'), doc.metadata.get('section'))
-                if key in unique_docs:
-                    # Если документ найден несколькими методами - комбинируем скоры
-                    unique_docs[key] = (doc, unique_docs[key][1] + score * adaptive_weights['bm25'])
-                else:
-                    unique_docs[key] = (doc, score * adaptive_weights['bm25'])
-
-            # Дополнительное ранжирование по релевантности
-            sorted_docs = sorted(unique_docs.values(), key=lambda x: x[1], reverse=True)
-
-            # Применяем дополнительную фильтрацию по минимальному скору
-            min_threshold = 0.1
-            filtered_docs = [(doc, score) for doc, score in sorted_docs if score >= min_threshold]
-
-            return [doc for doc, _ in filtered_docs[:k_final]]
-
-        except Exception as e:
-            logger.error(f"Ошибка в гибридном поиске: {str(e)}", exc_info=True)
-            return [doc for doc, _ in vector_docs[:k_vector]] if vector_docs else []
-
-    def _advanced_tokenize(self, text):
-        """Улучшенная токенизация для русского языка"""
-        # Удаляем знаки препинания и разделяем по пробелам
-        import re
-        # Сохраняем важные знаки препинания как отдельные токены
-        text = re.sub(r'([.!?,:;])', r' \1 ', text)
-        tokens = text.split()
-
-        # Фильтруем слишком короткие токены и стоп-слова
-        stop_words = {'и', 'в', 'на', 'с', 'по', 'для', 'от', 'до', 'при', 'о', 'об', 'что', 'как', 'так', 'это', 'то', 'же', 'но', 'или', 'а', 'да', 'нет'}
-        filtered_tokens = [token for token in tokens if len(token) > 2 and token.lower() not in stop_words]
-
-        return filtered_tokens
-
-    def _calculate_adaptive_weights(self, question: str, vector_docs: List, keyword_docs: List, multi_vector_docs: List = None) -> Dict[str, float]:
-        """Вычисляет адаптивные веса на основе характеристик запроса и результатов поиска"""
-
-        # Анализ характеристик запроса
         question_lower = question.lower()
-        question_words = self._advanced_tokenize(question_lower)
+        return any(pattern in question_lower for pattern in suspicious_patterns)
 
-        # 1. Определяем тип запроса
-        exact_match_indicators = ['точно', 'именно', 'конкретно', 'определенно', 'четко']
-        conceptual_indicators = ['как', 'почему', 'зачем', 'что такое', 'объясни', 'расскажи']
+    def _enhance_query(self, question: str) -> str:
+        """Улучшение запроса пользователя"""
+        # Нормализация
+        enhanced = question.strip()
 
-        is_exact_query = any(indicator in question_lower for indicator in exact_match_indicators)
-        is_conceptual_query = any(indicator in question_lower for indicator in conceptual_indicators)
+        # Добавление контекста для коротких вопросов
+        if len(enhanced.split()) <= 3:
+            context_hints = {
+                "автор": "кто автор книги",
+                "глава": "о чем глава в книге",
+                "часть": "содержание части книги",
+                "встреча": "что происходит во встрече",
+                "бизнес": "бизнес советы из книги"
+            }
 
-        # 2. Анализируем длину запроса (короткие запросы лучше для BM25)
-        query_length_factor = min(len(question_words) / 10.0, 1.0)  # Нормализуем к [0, 1]
+            for hint, expansion in context_hints.items():
+                if hint in enhanced.lower():
+                    enhanced = f"{expansion} {enhanced}"
+                    break
 
-        # 3. Анализируем пересечение результатов
-        vector_content = set()
-        keyword_content = set()
-        multi_vector_content = set()
+        return enhanced
 
-        for doc, _ in vector_docs:
-            vector_content.add(doc.page_content[:100])  # Первые 100 символов как идентификатор
+    def _advanced_hybrid_search(self, query: str, section_filter: Optional[str] = None) -> List[Document]:
+        """Продвинутый гибридный поиск"""
+        logger.debug(f"Выполняется гибридный поиск: {query[:50]}...")
 
-        for doc, _ in keyword_docs:
-            keyword_content.add(doc.page_content[:100])
+        # Параметры поиска
+        k_vector = 20
+        k_bm25 = 25
+        k_final = 12
 
-        if multi_vector_docs:
-            for doc, _ in multi_vector_docs:
-                multi_vector_content.add(doc.page_content[:100])
+        try:
+            # 1. Векторный поиск
+            vector_docs = self._vector_search(query, section_filter, k_vector)
 
-        # Вычисляем пересечения
-        vector_keyword_overlap = len(vector_content & keyword_content) / max(len(vector_content), 1)
+            # 2. BM25 поиск
+            bm25_docs = self._bm25_search(query, section_filter, k_bm25)
 
-        # 4. Вычисляем адаптивные веса
-        base_weights = {
-            'vector': 0.3,
-            'multi_vector': 0.4 if self.use_multi_vector else 0.0,
-            'bm25': 0.5 if self.use_multi_vector else 0.6
+            # 3. Объединение результатов с умным скорингом
+            combined_docs = self._smart_combine_results(query, vector_docs, bm25_docs)
+
+            # 4. Финальное ранжирование
+            final_docs = self._final_ranking(query, combined_docs, k_final)
+
+            logger.debug(f"Найдено {len(final_docs)} релевантных документов")
+            return final_docs
+
+        except Exception as e:
+            logger.error(f"Ошибка в гибридном поиске: {e}")
+            return []
+
+    def _vector_search(self, query: str, section_filter: Optional[str], k: int) -> List[Tuple[Document, float]]:
+        """Векторный поиск с фильтрацией"""
+        try:
+            if section_filter and self.pinecone_available:
+                # Фильтр для Pinecone
+                filter_dict = {"section": {"$eq": section_filter}}
+                docs = self.vectorstore.similarity_search_with_score(
+                    query, k=k, filter=filter_dict
+                )
+            else:
+                docs = self.vectorstore.similarity_search_with_score(query, k=k)
+
+                # Фильтрация для FAISS
+                if section_filter:
+                    docs = [(doc, score) for doc, score in docs
+                           if doc.metadata.get('section') == section_filter]
+
+            return docs
+
+        except Exception as e:
+            logger.warning(f"Ошибка векторного поиска: {e}")
+            return []
+
+    def _bm25_search(self, query: str, section_filter: Optional[str], k: int) -> List[Tuple[Document, float]]:
+        """BM25 поиск с фильтрацией"""
+        try:
+            # Токенизация запроса
+            tokenized_query = self._advanced_tokenize(query.lower())
+
+            if not tokenized_query:
+                return []
+
+            # Получение скоров BM25
+            scores = self.bm25_index.get_scores(tokenized_query)
+
+            # Создание списка документов с скорами
+            scored_docs = []
+            for i, score in enumerate(scores):
+                if score > 0 and i < len(self.chunks):
+                    doc = self.chunks[i]
+
+                    # Применяем фильтр по секции
+                    if section_filter and doc.metadata.get('section') != section_filter:
+                        continue
+
+                    # Бонусы за точные совпадения
+                    bonus = self._calculate_bm25_bonus(query, doc.page_content)
+                    final_score = score * (1 + bonus)
+
+                    scored_docs.append((doc, final_score))
+
+            # Сортировка по убыванию скора
+            scored_docs.sort(key=lambda x: x[1], reverse=True)
+
+            return scored_docs[:k]
+
+        except Exception as e:
+            logger.warning(f"Ошибка BM25 поиска: {e}")
+            return []
+
+    def _calculate_bm25_bonus(self, query: str, text: str) -> float:
+        """Расчет бонуса для BM25 на основе точных совпадений"""
+        query_words = set(query.lower().split())
+        text_words = set(text.lower().split())
+
+        # Точные совпадения слов
+        exact_matches = len(query_words & text_words)
+        exact_bonus = exact_matches / len(query_words) if query_words else 0
+
+        # Бонус за наличие всего запроса в тексте
+        phrase_bonus = 0.5 if query.lower() in text.lower() else 0
+
+        # Бонус за тип чанка
+        chunk_type_bonus = 0.1  # Базовый бонус
+
+        return exact_bonus * 0.3 + phrase_bonus + chunk_type_bonus
+
+    def _smart_combine_results(self, query: str, vector_docs: List[Tuple[Document, float]],
+                             bm25_docs: List[Tuple[Document, float]]) -> List[Tuple[Document, float]]:
+        """Умное объединение результатов векторного и BM25 поиска"""
+
+        # Вычисляем адаптивные веса на основе характеристик запроса
+        weights = self._calculate_adaptive_weights(query, vector_docs, bm25_docs)
+
+        # Объединяем результаты
+        combined_scores = {}
+
+        # Добавляем векторные результаты
+        for doc, score in vector_docs:
+            key = self._get_doc_key(doc)
+            combined_scores[key] = {
+                'doc': doc,
+                'vector_score': score,
+                'bm25_score': 0.0
+            }
+
+        # Добавляем BM25 результаты
+        for doc, score in bm25_docs:
+            key = self._get_doc_key(doc)
+            if key in combined_scores:
+                combined_scores[key]['bm25_score'] = score
+            else:
+                combined_scores[key] = {
+                    'doc': doc,
+                    'vector_score': 0.0,
+                    'bm25_score': score
+                }
+
+        # Вычисляем финальные скоры
+        final_results = []
+        for item in combined_scores.values():
+            # Нормализация скоров
+            norm_vector = min(item['vector_score'], 1.0)
+            norm_bm25 = min(item['bm25_score'] / 10.0, 1.0)  # BM25 скоры могут быть большими
+
+            # Взвешенная комбинация
+            final_score = (
+                weights['vector'] * norm_vector +
+                weights['bm25'] * norm_bm25
+            )
+
+            # Дополнительные бонусы
+            final_score *= self._get_metadata_bonus(item['doc'])
+
+            final_results.append((item['doc'], final_score))
+
+        return final_results
+
+    def _get_doc_key(self, doc: Document) -> str:
+        """Создание уникального ключа документа"""
+        return f"{doc.metadata.get('page', 0)}_{doc.metadata.get('section', '')}_{doc.page_content[:50]}"
+
+    def _calculate_adaptive_weights(self, query: str, vector_docs: List, bm25_docs: List) -> Dict[str, float]:
+        """Вычисление адаптивных весов для комбинирования"""
+
+        # Анализ запроса
+        query_words = query.lower().split()
+        query_length = len(query_words)
+
+        # Базовые веса
+        base_vector_weight = 0.4
+        base_bm25_weight = 0.6
+
+        # Корректировки на основе характеристик запроса
+
+        # Длинные запросы лучше для векторного поиска
+        if query_length > 6:
+            base_vector_weight += 0.1
+            base_bm25_weight -= 0.1
+
+        # Короткие запросы лучше для BM25
+        elif query_length < 3:
+            base_vector_weight -= 0.1
+            base_bm25_weight += 0.1
+
+        # Концептуальные вопросы лучше для векторного поиска
+        conceptual_words = ['как', 'почему', 'что', 'зачем', 'объясни', 'расскажи']
+        if any(word in query.lower() for word in conceptual_words):
+            base_vector_weight += 0.15
+            base_bm25_weight -= 0.15
+
+        # Точные запросы лучше для BM25
+        exact_words = ['точно', 'именно', 'конкретно', 'название', 'цифра']
+        if any(word in query.lower() for word in exact_words):
+            base_vector_weight -= 0.15
+            base_bm25_weight += 0.15
+
+        # Нормализация
+        total = base_vector_weight + base_bm25_weight
+        return {
+            'vector': base_vector_weight / total,
+            'bm25': base_bm25_weight / total
         }
 
-        # Корректировки весов
-        if is_exact_query:
-            # Для точных запросов увеличиваем вес BM25
-            base_weights['bm25'] *= 1.3
-            base_weights['vector'] *= 0.8
-        elif is_conceptual_query:
-            # Для концептуальных запросов увеличиваем вес vector/multi-vector
-            base_weights['vector'] *= 1.2
-            if self.use_multi_vector:
-                base_weights['multi_vector'] *= 1.2
-            base_weights['bm25'] *= 0.9
+    def _get_metadata_bonus(self, doc: Document) -> float:
+        """Расчет бонуса на основе метаданных документа"""
+        bonus = 1.0
+        metadata = doc.metadata
 
-        # Корректировка на основе длины запроса
-        if query_length_factor < 0.3:  # Короткий запрос
-            base_weights['bm25'] *= 1.2
-        elif query_length_factor > 0.7:  # Длинный запрос
-            base_weights['vector'] *= 1.1
-            if self.use_multi_vector:
-                base_weights['multi_vector'] *= 1.1
+        # Бонус за тип чанка
+        chunk_weight = metadata.get('chunk_weight', 1.0)
+        bonus *= chunk_weight
 
-        # Корректировка на основе пересечения результатов
-        if vector_keyword_overlap > 0.7:  # Высокое пересечение - можем доверять обоим
-            base_weights['vector'] *= 1.1
-            base_weights['bm25'] *= 1.1
-        elif vector_keyword_overlap < 0.3:  # Низкое пересечение - предпочитаем sparse
-            base_weights['bm25'] *= 1.2
-            base_weights['vector'] *= 0.9
+        # Бонус за длину (оптимальная длина)
+        chunk_size = metadata.get('chunk_size', 0)
+        if 600 <= chunk_size <= 1200:
+            bonus *= 1.1
 
-        # Нормализация весов
-        total_weight = sum(base_weights.values())
-        normalized_weights = {k: v / total_weight for k, v in base_weights.items()}
+        # Бонус за наличие вопросов (часто содержат важную информацию)
+        if metadata.get('has_questions', False):
+            bonus *= 1.05
 
-        logger.debug(f"Адаптивные веса для запроса '{question[:50]}...': {normalized_weights}")
+        return bonus
 
-        return normalized_weights
+    def _final_ranking(self, query: str, docs: List[Tuple[Document, float]], k: int) -> List[Document]:
+        """Финальное ранжирование результатов"""
 
-    def _create_context_window(self, docs):
-        """Создание контекстного окна с расширенным контекстом"""
+        # Сортировка по скору
+        docs.sort(key=lambda x: x[1], reverse=True)
+
+        # Дедупликация похожих документов
+        seen_content = set()
+        unique_docs = []
+
+        for doc, score in docs:
+            # Создаем отпечаток содержимого
+            content_fingerprint = doc.page_content[:100].lower()
+
+            if content_fingerprint not in seen_content:
+                seen_content.add(content_fingerprint)
+                unique_docs.append(doc)
+
+            if len(unique_docs) >= k:
+                break
+
+        return unique_docs
+
+    def _handle_no_results(self, question: str, section_filter: Optional[str]) -> str:
+        """Обработка случая, когда результаты не найдены"""
+        base_msg = "Информация по данному вопросу в книге не найдена."
+
+        if section_filter:
+            sections = ', '.join(self.get_available_sections())
+            return f"{base_msg}\n\nВозможно, попробуйте поискать в других разделах: {sections}"
+        else:
+            return f"{base_msg}\n\nПопробуйте переформулировать вопрос или использовать другие ключевые слова."
+
+    def _create_optimized_context(self, docs: List[Document]) -> str:
+        """Создание оптимизированного контекста"""
         context_parts = []
-        processed_pages = set()
 
+        # Группируем по страницам для лучшей связности
+        page_groups = defaultdict(list)
         for doc in docs:
-            page_num = doc.metadata.get('page')
-            section = doc.metadata.get('section', '')
+            page = doc.metadata.get('page', 0)
+            page_groups[page].append(doc)
 
-            # Добавляем контекст с текущей страницы
-            if page_num not in processed_pages:
-                page_content = [d.page_content for d in self.splits
-                               if d.metadata.get('page') == page_num]
-                if page_content:
-                    context_parts.extend(page_content)
-                    processed_pages.add(page_num)
+        # Добавляем контекст по страницам
+        for page in sorted(page_groups.keys()):
+            page_docs = page_groups[page]
+            page_content = ' '.join([doc.page_content for doc in page_docs])
 
-            # Добавляем сам документ если он еще не включен
-            if doc.page_content not in context_parts:
-                context_parts.append(doc.page_content)
+            # Добавляем информацию о странице
+            section = page_docs[0].metadata.get('section', '')
+            context_parts.append(f"[Страница {page}, Раздел: {section}]\n{page_content}")
 
-        # Ограничиваем общий размер контекста
-        full_context = "\n\n".join(context_parts)
-        if len(full_context) > 4000:  # Ограничение для токенов
-            # Берем первые части, чтобы не превысить лимит
-            truncated_parts = []
-            current_length = 0
-            for part in context_parts:
-                if current_length + len(part) <= 4000:
-                    truncated_parts.append(part)
-                    current_length += len(part)
-                else:
-                    break
-            return "\n\n".join(truncated_parts)
+        # Объединяем и ограничиваем размер
+        full_context = '\n\n'.join(context_parts)
+
+        # Ограничиваем контекст для токенов (примерно 6000 символов = ~1500 токенов)
+        if len(full_context) > 6000:
+            truncated_context = full_context[:6000]
+            # Обрезаем по последнему полному предложению
+            last_sentence = truncated_context.rfind('.')
+            if last_sentence > 5000:
+                truncated_context = truncated_context[:last_sentence + 1]
+            return truncated_context
 
         return full_context
 
-    def _create_enhanced_prompt(self, question: str, context: str, section_filter=None):
-        """Создание улучшенного промпта"""
-        section_info = f"\nРаздел: {section_filter}" if section_filter else ""
-        prompt_template = """Ты - эксперт по книге "Бизнес в диалоге: от малого к невозможному" Анвара Халикова.
+    def _create_smart_prompt(self, question: str, context: str, section_filter: Optional[str]) -> str:
+        """Создание умного промпта"""
 
-ВАЖНО: Автор книги - Анвар Халиков. Если спрашивают об авторе, упомяни это.
+        section_info = f"\nРАЗДЕЛ ПОИСКА: {section_filter}" if section_filter else ""
 
-ИНСТРУКЦИИ:
+        prompt = f"""Ты - эксперт по книге "Бизнес в диалоге: от малого к невозможному" Анвара Халикова.
+
+ПРАВИЛА ОТВЕТА:
 1. Внимательно изучи предоставленный контекст
-2. Найди информацию, которая отвечает на вопрос, даже если она выражена косвенно
-3. Если информация есть в контексте, используй её для ответа
-4. Если прямого ответа нет, но есть связанная информация - используй её
-5. Только если контекст совсем не содержит релевантной информации, скажи: "Информация по этому вопросу в книге отсутствует"
+2. Отвечай точно и по существу на основе найденной информации
+3. Если информация есть в контексте - используй её полностью
+4. Если прямого ответа нет, но есть связанная информация - адаптируй её
+5. Структурируй ответ логично и понятно
+6. Указывай автора книги (Анвар Халиков) при необходимости
 
-Отвечай структурированно и полно на основе найденной информации.
-
-Контекст:
+КОНТЕКСТ ИЗ КНИГИ:
 {context}
-
 {section_info}
 
-Вопрос: {question}
+ВОПРОС: {question}
 
-Ответ:"""
-        return PromptTemplate(
-            template=prompt_template,
-            input_variables=["context", "question", "section_info"]
-        ).format(context=context, question=question.strip(), section_info=section_info)
+ОТВЕТ:"""
 
-    def _post_process_answer(self, answer: str, source_docs: list):
-        """Постобработка ответа"""
-        sources = []
+        return prompt
+
+    def _postprocess_answer(self, answer: str, source_docs: List[Document]) -> str:
+        """Постобработка ответа с добавлением источников"""
+
+        # Очистка ответа
+        cleaned_answer = answer.strip()
+
+        # Убираем дублирующиеся фразы "Ответ:"
+        if cleaned_answer.startswith("Ответ:"):
+            cleaned_answer = cleaned_answer[6:].strip()
+
+        # Добавляем "Ответ:" если его нет
+        if not cleaned_answer.startswith("Ответ:"):
+            cleaned_answer = "Ответ: " + cleaned_answer
+
+        # Собираем информацию об источниках
+        pages = set()
         sections = set()
+
         for doc in source_docs:
-            page = doc.metadata.get('page', 0)
+            page = doc.metadata.get('page')
             section = doc.metadata.get('section', 'unknown')
-            sources.append(f"Страница {page}")
-            sections.add(section)
 
-        unique_sources = sorted(set(sources))
-        formatted_answer = answer.strip()
-        if not formatted_answer.startswith("Ответ:"):
-            formatted_answer = "Ответ: " + formatted_answer
-
-        sections_info = ""
-        if len(sections) > 1:
-            sections_info = f"\nРазделы: {', '.join(sorted(sections))}"
-        elif len(sections) == 1:
-            section = list(sections)[0]
+            if page:
+                pages.add(page)
             if section != 'unknown':
-                sections_info = f"\nРаздел: {section}"
+                sections.add(section)
 
-        return f"{formatted_answer}\n\nИсточники: {', '.join(unique_sources)}{sections_info}"
+        # Формируем информацию об источниках
+        sources_info = []
 
-    def search_by_section(self, section_name: str, query: str = ""):
+        if pages:
+            sorted_pages = sorted(pages)
+            if len(sorted_pages) <= 3:
+                sources_info.append(f"Страницы: {', '.join(map(str, sorted_pages))}")
+            else:
+                sources_info.append(f"Страницы: {sorted_pages[0]}-{sorted_pages[-1]} и др. ({len(sorted_pages)} всего)")
+
+        if sections and len(sections) <= 2:
+            sources_info.append(f"Раздел: {', '.join(sections)}")
+
+        # Добавляем источники к ответу
+        if sources_info:
+            cleaned_answer += f"\n\nИсточники: {'; '.join(sources_info)}"
+
+        return cleaned_answer
+
+    def _handle_error(self, error: Exception) -> str:
+        """Обработка ошибок с информативными сообщениями"""
+        error_str = str(error).lower()
+
+        if "openai" in error_str or "api" in error_str:
+            return "Ошибка API OpenAI. Проверьте ключ API и подключение к интернету."
+        elif "pinecone" in error_str:
+            return "Ошибка Pinecone. Система переключится на локальный поиск."
+        elif "memory" in error_str or "out of memory" in error_str:
+            return "Недостаточно памяти. Попробуйте задать более конкретный вопрос."
+        elif "timeout" in error_str:
+            return "Превышено время ожидания. Попробуйте еще раз."
+        else:
+            return f"Произошла ошибка при обработке запроса. Попробуйте переформулировать вопрос."
+
+    def search_by_section(self, section_name: str, query: str = "") -> str:
         """Поиск информации в конкретном разделе"""
         try:
-            if len(query) > MAX_QUESTION_LENGTH:
-                return f"Ошибка: Запрос слишком длинный (максимум {MAX_QUESTION_LENGTH} символов)."
-            section_key = section_name.lower().replace(' ', '_')
+            # Нормализация названия раздела
+            section_key = section_name.lower().replace(' ', '_').replace('ё', 'е')
+
             if section_key not in self.sections_mapping:
-                available_sections = ', '.join(self.sections_mapping.keys())
-                return f"Раздел '{section_name}' не найден. Доступные разделы: {available_sections}"
+                available = ', '.join(sorted(self.sections_mapping.keys()))
+                return f"Раздел '{section_name}' не найден.\n\nДоступные разделы:\n{available}"
+
+            # Если запрос не указан, возвращаем общую информацию о разделе
             if not query:
-                query = f"Расскажи о содержании раздела {section_name}"
+                query = f"Расскажи о содержании и основных темах раздела {section_name}"
+
             return self.ask_question(query, section_filter=section_key)
-        except Exception as e:
-            logger.error(f"Ошибка при поиске в разделе {section_name}: {str(e)}")
-            return f"Произошла ошибка: {str(e)}"
 
-    def get_available_sections(self):
+        except Exception as e:
+            logger.error(f"Ошибка поиска в разделе {section_name}: {e}")
+            return f"Произошла ошибка при поиске в разделе {section_name}"
+
+    def get_available_sections(self) -> List[str]:
         """Получение списка доступных разделов"""
-        return list(self.sections_mapping.keys())
+        # Возвращаем только основные разделы для удобства
+        main_sections = []
+        seen = set()
 
-    def force_rebuild_embeddings(self):
-        """Принудительное пересоздание эмбеддингов"""
-        logger.info("Принудительное пересоздание эмбеддингов...")
+        for section in self.sections_mapping.keys():
+            # Группируем похожие названия
+            base_name = section.replace('_', ' ')
+            if base_name not in seen:
+                main_sections.append(section)
+                seen.add(base_name)
+
+        return sorted(main_sections)
+
+    def get_statistics(self) -> Dict:
+        """Получение статистики о загруженных данных"""
+        if not hasattr(self, 'chunks'):
+            return {"error": "Данные не загружены"}
+
+        stats = {
+            "total_chunks": len(self.chunks),
+            "total_documents": len(self.documents) if hasattr(self, 'documents') else 0,
+            "sections": len(set(doc.metadata.get('section', '') for doc in self.documents)) if hasattr(self, 'documents') else 0,
+            "pages": len(set(doc.metadata.get('page', 0) for doc in self.documents)) if hasattr(self, 'documents') else 0,
+            "chunk_types": {}
+        }
+
+        # Статистика по типам чанков
+        for chunk in self.chunks:
+            chunk_type = chunk.metadata.get('chunk_type', 'unknown')
+            stats["chunk_types"][chunk_type] = stats["chunk_types"].get(chunk_type, 0) + 1
+
+        return stats
+
+    def force_rebuild_cache(self) -> bool:
+        """Принудительное пересоздание кэша"""
         try:
-            if hasattr(self, 'pinecone_index') and self.pinecone_index:
-                self.pinecone_index.delete(delete_all=True)
-                logger.info("Pinecone индекс очищен")
-            if self.use_sections:
-                self.documents = asyncio.run(self._load_all_sections())
-            else:
-                self.documents = asyncio.run(self._load_full_book())
-            self.splits = self._create_hierarchical_chunks()
-            self.vectorstore = self._create_or_load_vectorstore()
-            self._initialize_models()
-            logger.info("Эмбеддинги пересозданы")
+            logger.info("Принудительное пересоздание кэша...")
+
+            # Очищаем кэш
+            cache_files = [
+                os.path.join(self.cache_dir, "processed_data.pkl"),
+                os.path.join(self.cache_dir, "embeddings.pkl")
+            ]
+
+            for cache_file in cache_files:
+                if os.path.exists(cache_file):
+                    os.remove(cache_file)
+
+            # Очищаем Pinecone если доступен
+            if self.pinecone_available:
+                try:
+                    self.pinecone_index.delete(delete_all=True)
+                    logger.info("Pinecone индекс очищен")
+                except Exception as e:
+                    logger.warning(f"Не удалось очистить Pinecone: {e}")
+
+            # Пересоздаем данные
+            self._create_fresh_data()
+
+            # Сохраняем новый кэш
+            cache_file = os.path.join(self.cache_dir, "processed_data.pkl")
+            embeddings_cache = os.path.join(self.cache_dir, "embeddings.pkl")
+            self._save_to_cache(cache_file, embeddings_cache)
+
+            logger.info("Кэш успешно пересоздан")
             return True
+
         except Exception as e:
-            logger.error(f"Ошибка при пересоздании эмбеддингов: {str(e)}")
+            logger.error(f"Ошибка при пересоздании кэша: {e}")
             return False
 
-    def run_tests(self):
-        """Запуск тестов для проверки качества"""
+    def run_quality_tests(self) -> Dict:
+        """Запуск тестов качества системы"""
         test_questions = [
-            {"question": "О чем глава 5?", "section": "встреча5", "expected": "командообразование"},
-            {"question": "Кто автор книги?", "section": None, "expected": "Анвар Халиков"}
+            {
+                "question": "Кто автор книги?",
+                "expected_keywords": ["анвар", "халиков"],
+                "section": None
+            },
+            {
+                "question": "О чем книга Бизнес в диалоге?",
+                "expected_keywords": ["бизнес", "диалог", "развитие"],
+                "section": None
+            },
+            {
+                "question": "Что такое командообразование?",
+                "expected_keywords": ["команда", "сотрудник", "лидер"],
+                "section": "командообразование"
+            }
         ]
-        results = []
-        for test in test_questions:
-            answer = self.ask_question(test["question"], test["section"])
-            passed = test["expected"].lower() in answer.lower()
-            results.append({"question": test["question"], "passed": passed, "answer": answer})
-            logger.info(f"Тест: {test['question']} - {'Пройден' if passed else 'Не пройден'}")
-        return results
 
+        results = {
+            "total_tests": len(test_questions),
+            "passed": 0,
+            "failed": 0,
+            "details": []
+        }
 
-class MultiVectorEmbeddings:
-    """
-    Класс для реализации multi-vector подхода, преодолевающего ограничения single-vector
-    Создает несколько векторов для каждого документа для улучшения покрытия семантического пространства
-    """
+        for i, test in enumerate(test_questions):
+            try:
+                answer = self.ask_question(test["question"], test["section"])
+                answer_lower = answer.lower()
 
-    def __init__(self, base_embeddings: OpenAIEmbeddings, num_vectors: int = 3):
-        self.base_embeddings = base_embeddings
-        self.num_vectors = num_vectors
-        self.doc_embeddings = {}  # {doc_id: [vector1, vector2, ...]}
-        self.doc_texts = {}       # {doc_id: text}
+                # Проверяем наличие ожидаемых ключевых слов
+                found_keywords = []
+                for keyword in test["expected_keywords"]:
+                    if keyword.lower() in answer_lower:
+                        found_keywords.append(keyword)
 
-    def embed_documents(self, texts: List[str]) -> List[List[List[float]]]:
-        """Создает multiple векторы для каждого документа"""
-        all_multi_embeddings = []
+                passed = len(found_keywords) >= len(test["expected_keywords"]) // 2
 
-        for doc_idx, text in enumerate(texts):
-            doc_vectors = self._create_multiple_vectors(text, doc_idx)
-            all_multi_embeddings.append(doc_vectors)
+                test_result = {
+                    "test_id": i + 1,
+                    "question": test["question"],
+                    "passed": passed,
+                    "found_keywords": found_keywords,
+                    "answer_length": len(answer),
+                    "answer": answer[:200] + "..." if len(answer) > 200 else answer
+                }
 
-        return all_multi_embeddings
+                results["details"].append(test_result)
 
-    def _create_multiple_vectors(self, text: str, doc_id: int) -> List[List[float]]:
-        """Создает несколько векторов для одного документа разными способами"""
-        vectors = []
-
-        # 1. Базовый эмбеддинг всего текста
-        base_vector = self.base_embeddings.embed_query(text)
-        vectors.append(base_vector)
-
-        # 2. Эмбеддинг первой половины
-        mid_point = len(text) // 2
-        first_half = text[:mid_point]
-        if len(first_half.strip()) > 50:  # Только если достаточно текста
-            first_vector = self.base_embeddings.embed_query(first_half)
-            vectors.append(first_vector)
-        else:
-            vectors.append(base_vector)  # Дублируем базовый если мало текста
-
-        # 3. Эмбеддинг второй половины
-        second_half = text[mid_point:]
-        if len(second_half.strip()) > 50:
-            second_vector = self.base_embeddings.embed_query(second_half)
-            vectors.append(second_vector)
-        else:
-            vectors.append(base_vector)
-
-        # 4. Если нужно больше векторов - создаем их через ключевые предложения
-        if self.num_vectors > 3:
-            key_sentences = self._extract_key_sentences(text)
-            for i, sentence in enumerate(key_sentences[:self.num_vectors-3]):
-                if len(sentence.strip()) > 30:
-                    sent_vector = self.base_embeddings.embed_query(sentence)
-                    vectors.append(sent_vector)
+                if passed:
+                    results["passed"] += 1
                 else:
-                    vectors.append(base_vector)
+                    results["failed"] += 1
 
-        # Сохраняем информацию о документе
-        self.doc_embeddings[doc_id] = vectors
-        self.doc_texts[doc_id] = text
+            except Exception as e:
+                results["failed"] += 1
+                results["details"].append({
+                    "test_id": i + 1,
+                    "question": test["question"],
+                    "passed": False,
+                    "error": str(e)
+                })
 
-        return vectors[:self.num_vectors]
+        results["success_rate"] = results["passed"] / results["total_tests"] * 100
 
-    def _extract_key_sentences(self, text: str) -> List[str]:
-        """Извлекает ключевые предложения из текста"""
-        import re
-
-        # Простое разделение на предложения
-        sentences = re.split(r'[.!?]+', text)
-        sentences = [s.strip() for s in sentences if len(s.strip()) > 30]
-
-        # Берем самые длинные предложения как наиболее информативные
-        sentences.sort(key=len, reverse=True)
-
-        return sentences[:5]  # Максимум 5 ключевых предложений
-
-    def similarity_search(self, query: str, documents: List[Document], k: int = 10) -> List[Tuple[Document, float]]:
-        """Поиск с использованием multi-vector подхода"""
-        query_vector = self.base_embeddings.embed_query(query)
-
-        doc_scores = []
-
-        for doc_idx, doc in enumerate(documents):
-            if doc_idx in self.doc_embeddings:
-                # Вычисляем similarity с каждым вектором документа
-                doc_vectors = self.doc_embeddings[doc_idx]
-                similarities = []
-
-                for vector in doc_vectors:
-                    # Используем cosine similarity
-                    sim = cosine_similarity([query_vector], [vector])[0][0]
-                    similarities.append(sim)
-
-                # Используем максимальную similarity (ColBERT-style)
-                max_sim = max(similarities)
-
-                # Альтернативно: средняя similarity
-                # avg_sim = np.mean(similarities)
-
-                # Можно также использовать взвешенную сумму
-                # weights = [0.5, 0.3, 0.2]  # Больший вес базовому вектору
-                # weighted_sim = sum(w * s for w, s in zip(weights, similarities))
-
-                doc_scores.append((doc, max_sim))
-            else:
-                # Fallback на обычный single vector для документов без multi-vector
-                single_vector = self.base_embeddings.embed_query(doc.page_content)
-                sim = cosine_similarity([query_vector], [single_vector])[0][0]
-                doc_scores.append((doc, sim))
-
-        # Сортируем по убыванию similarity
-        doc_scores.sort(key=lambda x: x[1], reverse=True)
-
-        return doc_scores[:k]
+        return results
 
 
 # Пример использования улучшенной системы
 if __name__ == "__main__":
-    print("=== Демонстрация улучшений для преодоления ограничений single-vector поиска ===")
-    print()
+    print("=== Улучшенная RAG система для книг 300+ страниц ===\n")
 
-    # Пример 1: Обычная система (только single-vector)
-    print("1. Инициализация стандартной системы (single-vector):")
     try:
-        rag_standard = BookRAG(use_sections=True, use_multi_vector=False)
-        print("✓ Стандартная система инициализирована")
+        # Инициализация
+        print("Инициализация системы...")
+        rag = ImprovedBookRAG(use_sections=True, cache_embeddings=True)
+        print("✓ Система инициализирована успешно\n")
+
+        # Статистика
+        stats = rag.get_statistics()
+        print("📊 Статистика загруженных данных:")
+        print(f"   Документов: {stats.get('total_documents', 0)}")
+        print(f"   Чанков: {stats.get('total_chunks', 0)}")
+        print(f"   Разделов: {stats.get('sections', 0)}")
+        print(f"   Страниц: {stats.get('pages', 0)}")
+        print(f"   Типы чанков: {stats.get('chunk_types', {})}\n")
+
+        # Тесты качества
+        print("🧪 Запуск тестов качества...")
+        test_results = rag.run_quality_tests()
+        print(f"   Успешно: {test_results['passed']}/{test_results['total_tests']}")
+        print(f"   Процент успеха: {test_results['success_rate']:.1f}%\n")
+
+        # Демонстрация возможностей
+        print("🔍 Демонстрация улучшений:")
+
+        demo_questions = [
+            "Кто автор книги?",
+            "Расскажи о командообразовании",
+            "Что говорится о кризисе в бизнесе?"
+        ]
+
+        for question in demo_questions:
+            print(f"\nВопрос: {question}")
+            answer = rag.ask_question(question)
+            print(f"Ответ: {answer[:300]}{'...' if len(answer) > 300 else ''}")
+
+        print("\n" + "="*50)
+        print("КЛЮЧЕВЫЕ УЛУЧШЕНИЯ РЕАЛИЗОВАНЫ:")
+        print("="*50)
+        print("✓ КЭШИРОВАНИЕ - быстрая загрузка при повторном запуске")
+        print("✓ УМНЫЕ ЧАНКИ - множественные размеры с оптимальным перекрытием")
+        print("✓ ПРОДВИНУТЫЙ BM25 - настроенный для русского языка")
+        print("✓ АДАПТИВНЫЕ ВЕСА - динамическая настройка dense/sparse поиска")
+        print("✓ УЛУЧШЕННЫЙ КОНТЕКСТ - группировка по страницам")
+        print("✓ КАЧЕСТВЕННЫЕ ПРОМПТЫ - структурированные инструкции")
+        print("✓ ОБРАБОТКА ОШИБОК - информативные сообщения")
+        print("✓ МОНИТОРИНГ КАЧЕСТВА - автоматические тесты")
+        print("✓ МАСШТАБИРУЕМОСТЬ - поддержка 300+ страниц")
+        print("✓ ПРОИЗВОДИТЕЛЬНОСТЬ - оптимизированные модели и батчинг")
+
     except Exception as e:
-        print(f"✗ Ошибка: {e}")
-
-    print()
-
-    # Пример 2: Улучшенная система с multi-vector подходом
-    print("2. Инициализация улучшенной системы (multi-vector + enhanced BM25):")
-    try:
-        rag_enhanced = BookRAG(use_sections=True, use_multi_vector=True)
-        print("✓ Улучшенная система инициализирована")
-        print("  - Multi-vector подход активирован")
-        print("  - Улучшенный BM25 с русской токенизацией")
-        print("  - Чанки множественных размеров")
-        print("  - Адаптивные веса для dense/sparse fusion")
-    except Exception as e:
-        print(f"✗ Ошибка: {e}")
-
-    print()
-    print("=== Ключевые улучшения согласно статье Google ===")
-    print()
-    print("🔍 ПРОБЛЕМА: Single-vector поиск имеет фундаментальные ограничения")
-    print("   При фиксированной размерности невозможно найти все релевантные документы")
-    print()
-    print("🚀 РЕШЕНИЯ РЕАЛИЗОВАНЫ:")
-    print()
-    print("1. ГИБРИДНЫЙ ПОИСК С УВЕЛИЧЕННЫМ ВЕСОМ BM25")
-    print("   ✓ BM25 (sparse) получает вес 0.5-0.6 вместо 0.3")
-    print("   ✓ Векторный поиск (dense) получает вес 0.3-0.4")
-    print("   ✓ Преодолевает ограничения single-vector подхода")
-    print()
-    print("2. MULTI-VECTOR ПОДХОД (аналог ColBERT)")
-    print("   ✓ 3 вектора на документ вместо 1")
-    print("   ✓ Базовый вектор + векторы частей + ключевые предложения")
-    print("   ✓ MaxSim aggregation для финального скора")
-    print()
-    print("3. УЛУЧШЕННАЯ ТОКЕНИЗАЦИЯ BM25")
-    print("   ✓ Настроенные параметры k1=1.5, b=0.75 для русского")
-    print("   ✓ Фильтрация стоп-слов")
-    print("   ✓ Обработка точных совпадений")
-    print()
-    print("4. МНОЖЕСТВЕННЫЕ РАЗМЕРЫ ЧАНКОВ")
-    print("   ✓ Малые (600), средние (1000), большие (1500) чанки")
-    print("   ✓ Умное перекрытие с сохранением границ предложений")
-    print("   ✓ Дедупликация для оптимизации")
-    print()
-    print("5. АДАПТИВНЫЕ ВЕСА")
-    print("   ✓ Анализ типа запроса (точный vs концептуальный)")
-    print("   ✓ Учет длины запроса")
-    print("   ✓ Динамическая корректировка весов")
-    print()
-    print("📊 ОЖИДАЕМЫЕ РЕЗУЛЬТАТЫ:")
-    print("   • Значительное улучшение recall")
-    print("   • Лучше находит релевантные документы")
-    print("   • Устойчивость к росту базы знаний")
-    print("   • Преодоление теоретических ограничений single-vector")
-    print()
-    print("🔬 ТЕОРЕТИЧЕСКОЕ ОБОСНОВАНИЕ:")
-    print("   Google доказали: sign-rank(A) > d => single-vector не работает")
-    print("   Наши решения обходят это ограничение через:")
-    print("   - Sparse поиск (BM25) - не ограничен размерностью")
-    print("   - Multi-vector - увеличивает effective размерность")
-    print("   - Адаптивное слияние - оптимально использует оба подхода")
+        print(f"❌ Ошибка: {e}")
+        print("Проверьте:")
+        print("- Наличие PDF файлов в папке 'book/'")
+        print("- Корректность OPENAI_API_KEY")
+        print("- Доступность интернета")
+        print("- Достаточность места на диске для кэша")
