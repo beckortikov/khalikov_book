@@ -492,14 +492,11 @@ class ImprovedBookRAG:
 
     def _deduplicate_and_rank_chunks(self, chunks: List[Document]) -> List[Document]:
         """Дедупликация и ранжирование чанков"""
-        # Группируем по содержимому (первые 100 символов)
+        # Группируем по содержимому (полный текст для точности)
         content_groups = defaultdict(list)
         for chunk in chunks:
-            key = (
-                chunk.page_content[:100],
-                chunk.metadata.get('page'),
-                chunk.metadata.get('section')
-            )
+            # Используем хеш содержимого для ключа
+            key = hashlib.md5(chunk.page_content.encode()).hexdigest()
             content_groups[key].append(chunk)
 
         # Выбираем лучший чанк из каждой группы
@@ -509,9 +506,14 @@ class ImprovedBookRAG:
                 unique_chunks.append(group[0])
             else:
                 # Выбираем чанк с наибольшим весом
-                best_chunk = max(group, key=lambda x: x.metadata.get('chunk_weight', 1.0))
+                # Если веса равны, предпочитаем тот, что НЕ из секции "book" (более специфичный)
+                best_chunk = max(group, key=lambda x: (
+                    x.metadata.get('chunk_weight', 1.0),
+                    0 if x.metadata.get('section') == 'book' else 1
+                ))
                 unique_chunks.append(best_chunk)
 
+        logger.info(f"Дедупликация: {len(chunks)} -> {len(unique_chunks)}")
         return unique_chunks
 
     def _create_search_indexes(self):
@@ -730,13 +732,23 @@ class ImprovedBookRAG:
             prompt = self._create_smart_prompt(question, context, section_filter)
 
             # Получение ответа от модели
-            result = self.qa_chain({"question": prompt, "chat_history": self.chat_history})
+            # Используем прямой вызов LLM вместо qa_chain, чтобы использовать наш оптимизированный контекст
+            # qa_chain делает свой собственный поиск (retrieval), который может игнорировать наши результаты hybrid search
+            from langchain.schema import HumanMessage, SystemMessage
+            
+            messages = [
+                SystemMessage(content="Ты полезный ассистент, который отвечает на вопросы по книге."),
+                HumanMessage(content=prompt)
+            ]
+            
+            response = self.llm.invoke(messages)
+            answer_text = response.content
 
             # Постобработка ответа
-            final_answer = self._postprocess_answer(result["answer"], relevant_docs)
+            final_answer = self._postprocess_answer(answer_text, relevant_docs)
 
             # Сохранение в историю
-            self.chat_history.append((question, result["answer"]))
+            self.chat_history.append((question, answer_text))
 
             # Ограничиваем историю для производительности
             if len(self.chat_history) > 10:
@@ -786,9 +798,9 @@ class ImprovedBookRAG:
         logger.debug(f"Выполняется гибридный поиск: {query[:50]}...")
 
         # Параметры поиска
-        k_vector = 20
-        k_bm25 = 25
-        k_final = 12
+        k_vector = 30
+        k_bm25 = 30
+        k_final = 25
 
         try:
             # 1. Векторный поиск
@@ -949,9 +961,9 @@ class ImprovedBookRAG:
         query_words = query.lower().split()
         query_length = len(query_words)
 
-        # Базовые веса
-        base_vector_weight = 0.4
-        base_bm25_weight = 0.6
+        # Базовые веса - смещаем баланс в пользу векторного поиска (он лучше справляется с опечатками и смыслом)
+        base_vector_weight = 0.7
+        base_bm25_weight = 0.3
 
         # Корректировки на основе характеристик запроса
 
@@ -960,28 +972,32 @@ class ImprovedBookRAG:
             base_vector_weight += 0.1
             base_bm25_weight -= 0.1
 
-        # Короткие запросы лучше для BM25
-        elif query_length < 3:
-            base_vector_weight -= 0.1
-            base_bm25_weight += 0.1
-
+        # Короткие запросы - проверяем, есть ли имена (с большой буквы)
+        # Если есть имена, лучше верить вектору, так как в именах часто опечатки
+        has_capitalized = any(word[0].isupper() for word in query.split() if len(word) > 1)
+        if has_capitalized:
+             base_vector_weight += 0.2  # Boost vector more for names
+             base_bm25_weight -= 0.2
+        
         # Концептуальные вопросы лучше для векторного поиска
-        conceptual_words = ['как', 'почему', 'что', 'зачем', 'объясни', 'расскажи']
+        conceptual_words = ['как', 'почему', 'что', 'зачем', 'объясни', 'расскажи', 'кто']
         if any(word in query.lower() for word in conceptual_words):
-            base_vector_weight += 0.15
-            base_bm25_weight -= 0.15
+            base_vector_weight += 0.1
+            base_bm25_weight -= 0.1
 
-        # Точные запросы лучше для BM25
+        # Точные запросы лучше для BM25, но только если мы уверены в точности терминов
         exact_words = ['точно', 'именно', 'конкретно', 'название', 'цифра']
         if any(word in query.lower() for word in exact_words):
-            base_vector_weight -= 0.15
-            base_bm25_weight += 0.15
+            base_vector_weight -= 0.2
+            base_bm25_weight += 0.2
 
-        # Нормализация
-        total = base_vector_weight + base_bm25_weight
+        # Нормализация (защита от выхода за границы)
+        base_vector_weight = max(0.1, min(0.9, base_vector_weight))
+        base_bm25_weight = 1.0 - base_vector_weight
+        
         return {
-            'vector': base_vector_weight / total,
-            'bm25': base_bm25_weight / total
+            'vector': base_vector_weight,
+            'bm25': base_bm25_weight
         }
 
     def _get_metadata_bonus(self, doc: Document) -> float:
@@ -1039,35 +1055,45 @@ class ImprovedBookRAG:
 
     def _create_optimized_context(self, docs: List[Document]) -> str:
         """Создание оптимизированного контекста"""
-        context_parts = []
-
-        # Группируем по страницам для лучшей связности
-        page_groups = defaultdict(list)
+        
+        # 1. Отбираем документы, пока не достигнем лимита, сохраняя порядок релевантности
+        selected_docs = []
+        current_length = 0
+        max_length = 15000
+        
         for doc in docs:
+            doc_len = len(doc.page_content) + 100 # +100 на метаданные
+            if current_length + doc_len > max_length:
+                break
+            selected_docs.append(doc)
+            current_length += doc_len
+            
+        # 2. Теперь сортируем отобранные документы по страницам для связности чтения
+        # Группируем по страницам
+        page_groups = defaultdict(list)
+        for doc in selected_docs:
             page = doc.metadata.get('page', 0)
             page_groups[page].append(doc)
 
+        context_parts = []
         # Добавляем контекст по страницам
         for page in sorted(page_groups.keys()):
             page_docs = page_groups[page]
-            page_content = ' '.join([doc.page_content for doc in page_docs])
+            # Объединяем контент, убирая дубликаты (если чанки перекрываются)
+            unique_contents = set()
+            page_content_list = []
+            for doc in page_docs:
+                if doc.page_content not in unique_contents:
+                    unique_contents.add(doc.page_content)
+                    page_content_list.append(doc.page_content)
+            
+            page_content = ' '.join(page_content_list)
 
             # Добавляем информацию о странице
             section = page_docs[0].metadata.get('section', '')
             context_parts.append(f"[Страница {page}, Раздел: {section}]\n{page_content}")
 
-        # Объединяем и ограничиваем размер
         full_context = '\n\n'.join(context_parts)
-
-        # Ограничиваем контекст для токенов (примерно 6000 символов = ~1500 токенов)
-        if len(full_context) > 6000:
-            truncated_context = full_context[:6000]
-            # Обрезаем по последнему полному предложению
-            last_sentence = truncated_context.rfind('.')
-            if last_sentence > 5000:
-                truncated_context = truncated_context[:last_sentence + 1]
-            return truncated_context
-
         return full_context
 
     def _create_smart_prompt(self, question: str, context: str, section_filter: Optional[str]) -> str:
@@ -1078,12 +1104,13 @@ class ImprovedBookRAG:
         prompt = f"""Ты - эксперт по книге "Бизнес в диалоге: от малого к невозможному" Анвара Халикова.
 
 ПРАВИЛА ОТВЕТА:
-1. Внимательно изучи предоставленный контекст
-2. Отвечай точно и по существу на основе найденной информации
-3. Если информация есть в контексте - используй её полностью
-4. Если прямого ответа нет, но есть связанная информация - адаптируй её
-5. Структурируй ответ логично и понятно
-6. Указывай автора книги (Анвар Халиков) при необходимости
+1. Внимательно изучи предоставленный контекст.
+2. Отвечай точно и по существу на основе найденной информации.
+3. Если в вопросе есть имена (например, Шоира Музаффаровна), ищи похожие имена в тексте (возможны опечатки в книге или запросе, например Музафаровна).
+4. Если информации мало, используй всё, что есть, даже если это просто упоминание в благодарностях или списке наставников.
+5. Если прямого ответа нет, но есть связанная информация - адаптируй её.
+6. Структурируй ответ логично и понятно.
+7. Указывай автора книги (Анвар Халиков) при необходимости.
 
 КОНТЕКСТ ИЗ КНИГИ:
 {context}
