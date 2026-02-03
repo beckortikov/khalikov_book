@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from pydantic import BaseModel
-from main import BookRAG
+from book_rag.core import ImprovedBookRAG as BookRAG
 import os
 import logging
 import uvicorn

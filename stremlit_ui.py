@@ -6,7 +6,7 @@ import os
 # Добавляем путь к модулям
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from main import ImprovedBookRAG
+from book_rag.core import ImprovedBookRAG
 
 # Константы безопасности
 MAX_QUESTION_LENGTH = 200
